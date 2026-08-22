@@ -1,0 +1,26 @@
+[project]
+name = "do-dba"
+version = "1.0.0"
+description = "SSH harness that lets a hosted model do DBA work on a server, with its tests and recorded runs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # The OpenAI SDK is the client for both gateways: DigitalOcean Serverless
+    # Inference and OpenRouter each expose the OpenAI API, so do_dba.inference
+    # only has to vary the base URL and the headers.
+    "openai>=1.40",
+    "paramiko>=3.4",
+    "rich>=13.0",
+]
+
+[project.scripts]
+do-dba = "do_dba.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The harness only. The suites and helpers next to it are run in place, and the
+# timestamped run directories are records, not code.
+[tool.hatch.build.targets.wheel]
+packages = ["do_dba"]
