@@ -17,7 +17,13 @@ PROJECT = Path(__file__).resolve().parents[1]  # the suites sit in tests/, the h
 sys.path.insert(0, str(PROJECT))
 
 from do_dba.agent import SIGPIPE_EXIT, filter_matched_nothing, pipe_closed_early
-from do_dba.ssh import CommandResult, SYNTAX_ERROR_NOTE, wrap_command
+from do_dba.ssh import (
+    CommandResult,
+    SYNTAX_ERROR_NOTE,
+    script_check,
+    script_path,
+    wrap_command,
+)
 
 # Created up front: if the directory were missing, `touch` on the far end would
 # fail and every "nothing ran" assertion below would pass without proving a thing.
@@ -193,6 +199,65 @@ def main() -> int:
     check(failures, leaked.returncode == 2, f"expected exit 2, got {leaked.returncode}")
     check(failures, "syntax error" in leaked.stderr,
           f"bash's diagnosis of the leak was lost:\n{leaked.stderr}")
+
+    # ------------------------------------------------------- the script pre-check
+    # A script is a file the interpreter reads as it goes, so the same half-applied
+    # step the wrapping exists to prevent is possible inside one. This is the check
+    # run_script sends before it runs anything, against real bash and real python.
+    MARKER.unlink(missing_ok=True)
+    staged = SCRATCH / "dba_wrap_step01.sh"
+    staged.write_text(
+        f"touch {MARKER.as_posix()}\nmysql -e \"SELECT 1\n", encoding="utf-8"
+    )
+    parsed = shell(wrap_command(script_check(staged.as_posix(), "bash")))
+    check(failures, parsed.returncode != 0, "bash -n accepted a script with an unclosed quote")
+    check(failures, not MARKER.exists(),
+          "the parse pass ran the script's first line - a script would be half-applied")
+
+    # And the working one it must not reject, or every script would cost a round trip.
+    MARKER.unlink(missing_ok=True)
+    staged.write_text(
+        "set -euo pipefail\nfor db in app logs; do\n  echo \"$db\"\ndone\n", encoding="utf-8"
+    )
+    parsed = shell(wrap_command(script_check(staged.as_posix(), "bash")))
+    check(failures, parsed.returncode == 0,
+          f"bash -n rejected a valid script: {parsed.stderr}")
+    check(failures, not parsed.stdout.strip(),
+          f"the parse pass produced output, so it ran something: {parsed.stdout!r}")
+
+    # python's check is py_compile, and it must not leave a __pycache__ behind.
+    py_staged = SCRATCH / "dba_wrap_step01.py"
+    py_check = script_check(py_staged.as_posix(), "python3")
+    check(failures, "py_compile" in py_check and "PYTHONDONTWRITEBYTECODE=1" in py_check,
+          f"the python check is not what it should be: {py_check}")
+    # Probed by running it, not by looking for it on PATH: Windows puts a python3
+    # on PATH that is a Microsoft Store shim and not an interpreter at all.
+    if shell('python3 -c "pass"').returncode != 0:
+        # Said out loud rather than skipped in silence: the servers this runs
+        # against are Linux and have python3, and a developer machine that does not
+        # is the reason this half of the check went unexercised.
+        print("  note: no working python3 here, so only the bash half ran against a real interpreter")
+    else:
+        py_staged.write_text("import os\nprint(os.getcwd())\n", encoding="utf-8")
+        parsed = shell(wrap_command(py_check))
+        check(failures, parsed.returncode == 0, f"py_compile rejected valid python: {parsed.stderr}")
+        check(failures, not (SCRATCH / "__pycache__").exists(),
+              "the python parse pass left a __pycache__ beside the script")
+        py_staged.write_text("def f(:\n    pass\n", encoding="utf-8")
+        parsed = shell(wrap_command(py_check))
+        check(failures, parsed.returncode != 0, "py_compile accepted python that does not parse")
+
+    staged.unlink(missing_ok=True)
+    py_staged.unlink(missing_ok=True)
+
+    # The path is the one thing the model, the transcript and the server must agree
+    # on, so it is fixed by the step number and nothing else.
+    check(failures, script_path(3, "bash") == "/tmp/dba-harness/step03.sh",
+          f"a bash script goes to {script_path(3, 'bash')}")
+    check(failures, script_path(12, "python3") == "/tmp/dba-harness/step12.py",
+          f"a python script goes to {script_path(12, 'python3')}")
+    check(failures, script_path(3, "bash") == script_path(3, "bash"),
+          "the same step must resolve to the same path twice")
 
     MARKER.unlink(missing_ok=True)
     print("FAILURES" if failures else "all checks passed")

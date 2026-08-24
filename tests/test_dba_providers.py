@@ -270,11 +270,25 @@ def main() -> int:
     check(failures, openrouter.usage_accounting and not digitalocean.usage_accounting,
           "the wrong gateways are being asked what a reply cost")
     unreachable = "http://127.0.0.1:1/v1"  # nothing is sent; only the parameters are read
-    asked = InferenceClient(api_key="k", base_url=unreachable, usage_accounting=True)._accounting()
+    billed = InferenceClient(api_key="k", base_url=unreachable, usage_accounting=True)
+    plain = InferenceClient(api_key="k", base_url=unreachable)
+    asked = billed._extensions()
     check(failures, asked == {"extra_body": {"usage": {"include": True}}},
           f"the cost report is not being asked for: {asked}")
-    check(failures, InferenceClient(api_key="k", base_url=unreachable)._accounting() == {},
+    check(failures, plain._extensions() == {},
           "a gateway that reports no costs should be sent nothing extra")
+
+    # Both extensions share one extra_body, so asking for thinking must not stop a
+    # run asking what it cost - the two travel in the same dict and the second
+    # would otherwise replace the first.
+    both = billed._extensions("high")
+    check(failures, both == {"extra_body": {"usage": {"include": True},
+                                            "reasoning": {"effort": "high"}}},
+          f"an effort displaced the cost report: {both}")
+    check(failures, plain._extensions("low") == {"extra_body": {"reasoning": {"effort": "low"}}},
+          "an effort must travel even where the gateway reports no costs")
+    check(failures, plain._extensions(None) == {} and billed._extensions("") == asked,
+          "an unset effort must send nothing, not an empty reasoning block")
 
     for raw, want, why in (
         ({"cost": 0.0123}, 0.0123, "a reported cost"),

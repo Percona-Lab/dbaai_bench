@@ -1,8 +1,9 @@
 # do-dba
 
 Give a hosted model an SSH login and a DBA task in plain English, and it does the
-work on the server: one command per reply, each one classified before it runs, and
-nothing reported as finished until the harness has re-run the checks itself.
+work on the server: one command — or one script — per reply, each classified before
+it runs, and nothing reported as finished until the harness has re-run the checks
+itself.
 
 ```bash
 uv run dba.py --host 203.0.113.10 --task \
@@ -87,10 +88,10 @@ the billed one (see [CLI flags](#cli-flags)).
    when there is more than one). `--probe` stops here and just prints it — no task
    needed, and nothing on the server changes.
 2. **Plan.** In the default mode the model writes a plan and you approve it once.
-3. **Step.** Every reply is exactly one step — `run`, `write_file`, `done` or
-   `abort` — in a line-based format ([do_dba/protocol.py](do_dba/protocol.py)).
-   A reply that cannot be read is explained back to the model rather than killing
-   the run.
+3. **Step.** Every reply is exactly one step — `run`, `script`, `write_file`,
+   `done` or `abort` — in a line-based format
+   ([do_dba/protocol.py](do_dba/protocol.py)). A reply that cannot be read is
+   explained back to the model rather than killing the run.
 4. **Classify, then execute.** The guard sees the command before the server does.
    Output, exit code and timing go back as the next observation, so a failure is
    something the model reads and fixes.
@@ -181,8 +182,8 @@ server is a run better done one server at a time.
 What changes with two or more:
 
 - **Every step says where it runs.** `HOST: replica` is added to the step format,
-  and a `run` or `write_file` step without one — or naming something that is not a
-  server in the run — is refused and handed back unrun. Nothing is broadcast and
+  and a `run`, `script` or `write_file` step without one — or naming something that
+  is not a server in the run — is refused and handed back unrun. Nothing is broadcast and
   nothing is guessed: on a pair the two servers are configured differently on
   purpose, and `DROP DATABASE app` is routine on the node being rebuilt and
   catastrophic on the one serving traffic. The name may be written as the model
@@ -269,7 +270,7 @@ you can see what a model intends to do to a server it will never touch.
 
 ## The guard
 
-Every command and every file write is classified before execution
+Every command, every script and every file write is classified before execution
 ([do_dba/guard.py](do_dba/guard.py)) as one of three outcomes:
 
 - **ALLOW** — runs.
@@ -332,6 +333,81 @@ with every quote closed and a bare `(` the shell will not have. The guard has no
 shell parser and no business guessing at which words are English, so it passes the
 step and `bash -n` refuses it.
 
+## Scripts
+
+Some work has no one-line form. A loop over three databases, a wait-for-it retry, a
+check whose answer decides the next command — chained with `&&` across a screen's
+width these are unreadable and unreviewable, and the recorded runs are full of them.
+So a script is a step of its own:
+
+```
+THOUGHT: create both databases and the service user in one go
+ACTION: script
+INTERPRETER: bash
+SCRIPT_BEGIN
+#!/bin/bash
+set -euo pipefail
+for db in app logs; do
+  mysql -e "CREATE DATABASE IF NOT EXISTS $db"
+done
+mysql -e "CREATE USER 'svc'@'localhost' IDENTIFIED BY '{{DBA_SECRET:mysql_svc}}'"
+SCRIPT_END
+```
+
+The harness classifies the whole body, copies it to
+`/tmp/dba-harness/step<NN>.sh` at mode 0700, parses it there without running it,
+runs it by naming the interpreter, and hands back the exit code, stdout and stderr
+exactly as for a command — plus the path, so a later step can read the file or fix
+one line of it. `INTERPRETER:` is `bash` or `python3`, however the model spells it
+(`sh`, `/bin/bash`, `python`, `python3.12`); with no such line the shebang decides,
+and with neither it is bash. A third language is refused rather than guessed at,
+because the guard has rules for those two and nothing to say about perl.
+
+Four things follow from a script being one step rather than many:
+
+- **It is judged whole, before any of it is copied.** One blocked line stops the
+  whole script and the model is told which line — `line 3 of the script, 'mysql':
+  bare mysql opens a client session`. Nothing above that line runs, which is the
+  point: an interpreter reads a file as it goes, so a script judged line by line as
+  it ran would half-apply a step that was approved whole. This is the same reason
+  every command gets a `bash -n` pass, and scripts get one too (`py_compile` for
+  python) before execution.
+- **What you approve is the body.** A CONFIRM shows the script itself, not a summary
+  of it, and the transcript and report keep it in full. Approving a description of a
+  script is not approving the script.
+- **Python is judged as python.** Read as shell, a python file is line after line of
+  unknown program names — which is to say not judged at all. So it is parsed
+  (`ast.parse`, which runs nothing) and its calls are mapped onto the rules that
+  already exist: a string on its way to `os.system` or `subprocess.run` is
+  classified as the command it is, `shutil.rmtree` and `os.remove` against the same
+  path tables as `rm`, `shutil.move` and `os.rename` as `mv`, `open(path, 'w')` and
+  `Path(path).write_text()` as a file write, and SQL handed to a driver's
+  `execute()` as the SQL inside `mysql -e`. `eval`/`exec`/`compile`/`__import__` are
+  BLOCKed — they run text the guard cannot read — and so is `input()`, which on a
+  closed stdin raises `EOFError` on the spot rather than waiting. Python that does
+  not parse is BLOCKed too: a script this cannot read is one whose danger it cannot
+  assess. This also closed a hole that predated scripts, where a `.py` file written
+  with `write_file` and run afterwards was never classified at all.
+- **Placeholders still resolve on the way out only.** `{{DBA_SECRET:...}}` in a
+  script body becomes a real password in the file on the server and nowhere else;
+  the transcript, the report and the approval prompt all keep the placeholder. The
+  file is chmod 0700 before the body is written to it, not after.
+
+Two blind spots, both deliberate and both shared with shell:
+
+- A value the parser cannot fold is not judged. `os.remove(target)`, where `target`
+  was built ten lines up, passes — exactly as `rm -rf "$DATA"` does, for the same
+  reason. Where a fragment *can* be read it is used: `f"rm -rf /var/lib/mysql/{db}"`
+  still reads as a delete under the data directory.
+- A whole command that cannot be read asks rather than passing quietly.
+  `subprocess.run(cmd, shell=True)` is an instruction stream the guard cannot see,
+  which is what `curl … | sh` is, and it gets the same CONFIRM. A partly-readable
+  one does not: `subprocess.run(["mysql", "-e", sql])` goes straight through.
+
+Nothing of the harness's own is injected into the body — no `pipefail`, no `set -e`.
+What runs on the server is byte for byte what was judged, and what the model wants
+of its shell it writes at the top itself.
+
 ## Passwords the model never sees
 
 The model writes `{{DBA_SECRET:mysql_app}}` where a password belongs. The harness
@@ -382,7 +458,9 @@ there. The harness runs them itself, along with its own standing checks (active
 database services, listening sockets), and:
 
 - if any check fails, the failures are handed back to the model and the run
-  continues (twice, then the run ends as `unverified`);
+  continues (twice, then the run ends as `unverified`) — and a check that failed
+  without printing anything that could explain it is said to be that, rather than
+  left as a bare exit code the model has to take apart itself;
 - if the `done` step carries **no** check at all, it is handed back too. Nothing
   would have been re-run, so the claim would have been taken on trust — the one
   thing this harness will not do.
@@ -420,7 +498,7 @@ line from it and the next run generates a new value for that name;
 | --- | --- |
 | servers | `--host [NAME=][USER@]HOST[:PORT]` (required except with `--list-models`, repeatable; unnamed servers are labelled `node1`, `node2`, … and the model assigns the roles — see [More than one server](#more-than-one-server)), `-u/--user` (root), `-p/--port` (22), `-i/--key`, `--ask-key-passphrase`, `--ask-password`, `--no-server-secrets`, `--accept-host-key` |
 | task | `--task ...`, `--task-file PATH`, `-m/--model`, `--provider {openrouter,digitalocean}` (openrouter), `--mode {plan,step,auto,unattended}`, `--dry-run`, `--yes`, `--probe` |
-| limits | `--max-steps` (40), `--timeout` (300s per command), `--max-cost USD`, `--temperature` (0.2) |
+| limits | `--max-steps` (40), `--timeout` (300s per command), `--max-cost USD`, `--temperature` (0.2), `--effort {low,medium,high}` (off) |
 | output | `--runs-dir` (`output/` in this project, or `$DBA_RUNS_DIR`), `--list-models`, `--no-color`, `--version` |
 
 Cost is what the gateway says it charged, wherever it will say. Every OpenRouter
@@ -437,6 +515,18 @@ Either way `--max-cost` stops the run when the spend reaches it. Command output
 is truncated to 3000 characters per step before it goes into the prompt, and
 older observations are trimmed, so a long run's prompt does not grow without
 bound.
+
+`--effort` asks the model to think before each step. It travels to the gateway as
+one word and the gateway turns it into whatever the model upstream wants — a
+token budget for Anthropic, a reasoning effort for OpenAI — which is why an
+effort is portable where a per-provider knob is not. A model that cannot be asked
+is not a failed run: the request is retried without the ask and the run says so.
+Unset sends nothing at all, which is not the same as asking for none — a
+reasoning model goes on reasoning at the gateway's own default for it, as every
+run so far has. Thinking is billed as output, so a high effort can cost several
+times a step that did none, and `--max-cost` is reached sooner. A long thinking
+phase is also one silent request: the reply is not streamed, so raise
+`DO_INFERENCE_TIMEOUT` (180s) if a model is cut off mid-thought.
 
 ## Notes on behaviour
 
@@ -564,6 +654,26 @@ bound.
   there exit 1 is the answer to the question the model asked. Rule 6 now also
   tells the model not to write steps that end in a filter, and not to throw
   stderr away on a step it may have to debug.
+- **A check that fails without saying why is told so.** Five of the seven failed
+  `VERIFY` checks across the recorded runs printed nothing that could explain
+  them, in three separate runs, and four discarded the answer themselves —
+  `| grep -q '^1$'`, `test "$(…)" = "1"`. The worst shape collapses several facts
+  into one boolean: `SELECT @@version LIKE '9.7.%' AND @@gtid_mode='ON' AND
+  @@require_secure_transport='ON' AND @@server_id=1 | grep -q '^1$'` came back
+  exit 1 on both servers of one run with the password warning as its only output,
+  so the exit code could not say which of the four conjuncts was false. Everything
+  it checked was in fact there; the fourth compared a *boolean* system variable to
+  the string `'ON'`, and a boolean reads back as `1`. That run spent two steps
+  splitting its own expression apart by hand — `SELECT
+  @@require_secure_transport, @@require_secure_transport='ON'` — to find it. So
+  when a check fails and nothing in its output could explain it, the harness says
+  that, names the shape that kept the value where the command has one, and asks
+  for a `run` step printing the values followed by one `VERIFY` line per fact. The
+  password warning does not count as output, since it is on 59 of the recorded
+  checks and explains none of them. It fires on neither a timeout (there the
+  silence is the clock) nor the harness's own standing checks (not the model's to
+  rewrite), and rule 10 now asks for checks that print what they looked at and
+  names the boolean-variable trap up front.
 - **Root or passwordless sudo is assumed.** The survey checks; an account with
   neither gets a warning and one chance to carry on before the run starts, since
   almost every step would otherwise fail on a `sudo` password prompt.
@@ -590,8 +700,8 @@ bound.
 | [do_dba/agent.py](do_dba/agent.py) | The loop: system prompt, one step per reply, observations, independent verification, limits |
 | [do_dba/protocol.py](do_dba/protocol.py) | The step format and its tolerant parser |
 | [do_dba/fleet.py](do_dba/fleet.py) | The servers in a run: `--host` parsing, names, which one a step means, peer reachability |
-| [do_dba/guard.py](do_dba/guard.py) | ALLOW / CONFIRM / BLOCK classification of commands and file writes |
-| [do_dba/ssh.py](do_dba/ssh.py) | SSH connection, host-key policy, command execution, file upload over SFTP |
+| [do_dba/guard.py](do_dba/guard.py) | ALLOW / CONFIRM / BLOCK classification of commands, shell scripts, python scripts and file writes |
+| [do_dba/ssh.py](do_dba/ssh.py) | SSH connection, host-key policy, command execution, script staging, file upload over SFTP |
 | [do_dba/facts.py](do_dba/facts.py) | Read-only survey of the server before anything changes |
 | [do_dba/secrets.py](do_dba/secrets.py) | `{{DBA_SECRET:name}}` generation, substitution, redaction, and the keeper file each server holds so the next run can log in |
 | [do_dba/report.py](do_dba/report.py) | Run directory, `transcript.jsonl`, `report.md` |
@@ -600,7 +710,7 @@ bound.
 | [do_dba/term.py](do_dba/term.py) | Output encoding safety and ASCII glyph fallback |
 | [run_tests.py](run_tests.py) | Runs every offline suite and prints one line each |
 | [tests/](tests/) | `test_dba_*.py` — the suites, see [The tests](#the-tests) |
-| [fake_droplet.py](fake_droplet.py) | A simulated Ubuntu droplet: apt, systemd, mysql, mariadb, postgres, mongodb, valkey, docker |
+| [fake_droplet.py](fake_droplet.py) | A simulated Ubuntu droplet: apt, systemd, shell scripts with `if` and `for`, mysql, mariadb, postgres, mongodb, valkey, docker |
 | [mock_do_server.py](mock_do_server.py) | A stand-in for `https://inference.do-ai.run/v1` |
 | [probe_droplet.py](probe_droplet.py) | Checks the simulator against commands live models actually sent |
 | [list_models.py](list_models.py) | What the current key can reach |
@@ -627,16 +737,16 @@ stops it afterwards. Everything it runs is offline: no key, no network, no serve
 
 | Suite | What it covers |
 | --- | --- |
-| `guard` | Every guard verdict and every reply the parser has to survive, as a table of cases |
-| `offline` | The whole loop against `fake_droplet.py` with a scripted model — statuses, verification, secrets, compaction, protocol recovery |
+| `guard` | Every guard verdict — commands, file bodies, shell scripts, python scripts — and every reply the parser has to survive, as a table of cases |
+| `offline` | The whole loop against `fake_droplet.py` with a scripted model — statuses, verification, unreadable checks, secrets, compaction, protocol recovery, script steps |
 | `prompts` | Who answers each y/n question — the operator, `--yes` or `--mode unattended` — and that answering them all still leaves the guard's blocks in force |
 | `engines` | MariaDB, Valkey and MongoDB end to end — compatibility names, a runtime password that has to be rewritten to survive a restart, a vendor repository, authorization turned on after the fact |
 | `fleet` | Several servers — `--host` forms, labelling the ones left unnamed, which server a `HOST:` line means, refusing a step that does not say, scoped checks, peer reachability, and two two-droplet MySQL replication runs judged from both ends |
 | `secrets` | Credentials across runs — one name however it is spelled, the keeper file on the server and back off it, two servers disagreeing, and a second run that logs in with the first run's password without ever seeing it |
-| `wrap` | `wrap_command` handed to a real bash: syntax pre-flight, pipefail, quoting, heredocs |
+| `wrap` | `wrap_command` and the script pre-check handed to a real bash: syntax pre-flight, pipefail, quoting, heredocs, script paths |
 | `providers` | Model id shapes, key discovery, the provider split, and the price tiers |
 | `openrouter-wire` | The CLI end to end over real HTTP against a stub gateway |
-| `client` | The inference client against `mock_do_server.py` — replies, streaming, reasoning, usage, a dropped parameter, a refused key |
+| `client` | The inference client against `mock_do_server.py` — replies, streaming, reasoning, usage, an effort that travels, a model that refuses two parameters one complaint at a time, a refused key |
 
 `tests/test_dba_live.py` is not in the runner. It drives the harness with a real
 hosted model against the fake droplet — real key, real money — so it stays
@@ -691,11 +801,18 @@ drawing and accented characters, and the default codec on this machine fails on
 them. That applies to writing, too: anything printing what a transcript contains
 needs `sys.stdout.reconfigure(encoding="utf-8", errors="replace")`.
 
-As of 2026-08-21: 17 runs and 415 step records — 392 `run`, 12 `write_file`, 11
-`done` — plus 38 protocol errors the harness recovered from. The expected replay
-drift is 6 guard verdicts and 2 parser refusals, all of them deliberate: see
-[Notes on behaviour](#notes-on-behaviour) above. Both refusals are steps that
-really did execute at the time, which is the point of keeping the corpus.
+As of 2026-08-22: 30 runs and 986 step records — 896 `run`, 65 `write_file`, 25
+`done` — plus 43 protocol errors the harness recovered from. The expected replay
+drift is 11 guard verdicts, all of them deliberate: see
+[Notes on behaviour](#notes-on-behaviour) above. Several are steps that really did
+execute at the time, which is the point of keeping the corpus.
+
+The corpus predates `ACTION: script`, so it says nothing about that path. What it
+does say is that adding it moved nothing else: replayed against the guard as it
+stood before, all 896 `run` steps and 65 `write_file` steps come back with the same
+verdict *and the same reason*, and all 986 step records re-parse identically. The
+recorded runs are also why the script action exists — the corpus is full of steps
+chaining five commands with `&&` because there was no other way to say it.
 
 ## Keep it private
 

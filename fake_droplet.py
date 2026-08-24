@@ -22,7 +22,7 @@ import shlex
 from dataclasses import dataclass, field
 
 from do_dba.facts import PROBES
-from do_dba.ssh import CommandResult
+from do_dba.ssh import CommandResult, script_path
 
 # Answers to the harness's own probes, keyed by probe name.
 PROBE_ANSWERS = {
@@ -412,6 +412,36 @@ class FakeDroplet:
             exit_code=0, stdout="", stderr="", duration=0.2,
         )
 
+    def run_script(self, body: str, interpreter: str = "bash", index: int = 1,
+                   timeout: float = 300.0) -> CommandResult:
+        """Stage a script where SSHRunner would, then interpret it as bash does.
+
+        The path comes from the harness itself rather than being made up here, so a
+        test that checks what the model was told about the file is checking the
+        same string the real runner would have produced.
+
+        python is staged and not run. This droplet understands shell because it was
+        written to, and a python interpreter is not something to fake: a script
+        that appears to succeed here without any of its statements happening would
+        make the offline suite claim things the real thing does not do.
+        """
+        path = script_path(index, interpreter)
+        self.files[path] = body
+        if interpreter == "python3":
+            return CommandResult(
+                command=f"{interpreter} {path}",
+                exit_code=1,
+                stdout="",
+                stderr=f"fake droplet: python is not interpreted here; {path} was staged, not run\n",
+                duration=0.1,
+            )
+        result = self.run(f"bash {path}")
+        return CommandResult(
+            command=f"{interpreter} {path}",
+            exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr,
+            duration=0.4,
+        )
+
     def _dispatch(self, command: str) -> tuple[int, str, str]:
         probe = self._probe_by_command.get(command)
         if probe is not None:
@@ -514,6 +544,20 @@ class FakeDroplet:
                 continue
             if word == "then":
                 continue
+            if word == "for":
+                # Unrolled rather than interpreted: the body is spliced back into
+                # the line stream once per word, with the variable already
+                # substituted, so everything below - set -e, if blocks, pipelines -
+                # applies inside the loop without knowing it is in one.
+                after, expanded = self._unroll(lines, number - 1)
+                if after is None:
+                    return 2, "".join(out), (
+                        "".join(err)
+                        + f"bash: line {number}: syntax error: unexpected end of file\n"
+                    )
+                lines[number - 1:after] = expanded
+                number -= 1
+                continue
             if not all(entry["running"] for entry in chain):
                 continue  # inside a branch that was not taken
 
@@ -525,6 +569,68 @@ class FakeDroplet:
             if code != 0 and strict:
                 break
         return code, "".join(out), "".join(err)
+
+    @classmethod
+    def _unroll(cls, lines: list[str], start: int) -> tuple[int | None, list[str]]:
+        """A `for x in a b; do ... done` loop, flattened into the lines it runs.
+
+        Returns the index just past the loop's `done` and the lines to put in its
+        place, or (None, []) when there is no `done` - which is a real script's
+        commonest loop mistake and is reported as bash reports it.
+
+        A loop is why a script exists at all: `for db in app logs` is the shape that
+        has no one-line form, so a simulator that could not run one could not be
+        used to test scripts.
+        """
+        header = re.match(
+            r"^for\s+([A-Za-z_]\w*)\s+in\s+(.*?)(?:;|\s)\s*do\b(.*)$", lines[start].strip()
+        )
+        if header:
+            name, words, inline = header.group(1), header.group(2), header.group(3).strip()
+            body_from = start + 1
+        else:
+            # `do` on its own line under the header, which is the other way models
+            # write it.
+            plain = re.match(r"^for\s+([A-Za-z_]\w*)\s+in\s+(.*?);?\s*$", lines[start].strip())
+            if not plain or start + 1 >= len(lines) or lines[start + 1].strip() != "do":
+                return None, []
+            name, words, inline = plain.group(1), plain.group(2), ""
+            body_from = start + 2
+
+        # Whatever followed `do` on the header line is the first of the body, and a
+        # `done` on that same line closes a one-line loop.
+        trimmed = re.sub(r";?\s*\bdone;?\s*$", "", inline).strip()
+        body = [trimmed] if trimmed else []
+        end = body_from
+        if trimmed == inline.strip() or not inline:
+            depth = 1
+            while end < len(lines):
+                word = re.match(r"[a-z]+", lines[end].strip())
+                word = word.group(0) if word else ""
+                if word in {"for", "while", "until"}:
+                    depth += 1  # a nested loop, unrolled in turn when it is reached
+                elif word == "done":
+                    depth -= 1
+                    if depth == 0:
+                        return end + 1, cls._substitute(name, words, body)
+                body.append(lines[end])
+                end += 1
+            return None, []
+        return end, cls._substitute(name, words, body)
+
+    @classmethod
+    def _substitute(cls, name: str, words: str, body: list[str]) -> list[str]:
+        """The loop body once per word, with the loop variable already replaced.
+
+        By regex and not str.replace, so that a loop over `db` leaves `$dbname`
+        alone - which is how a real shell reads it.
+        """
+        try:
+            items = shlex.split(words)
+        except ValueError:
+            items = words.split()
+        holes = re.compile(r"\$\{" + re.escape(name) + r"\}|\$" + re.escape(name) + r"\b")
+        return [holes.sub(lambda _match: item, line) for item in items for line in body]
 
     @staticmethod
     def _split_then(line: str) -> tuple[str, str]:

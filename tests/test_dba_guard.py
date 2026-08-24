@@ -364,6 +364,94 @@ SCRIPT_BODIES: list[tuple[str, str, str]] = [
     ("/usr/local/bin/dbsetup", "#!/usr/bin/env bash\nmysql -e 'DROP DATABASE app'\n", guard.CONFIRM),
     # not a script: a .sql file is data, not commands
     ("/tmp/seed.sql", "DELETE FROM app.sessions;\n", guard.ALLOW),
+    # judged as python, because judged as shell it is line after line of unknown
+    # programs - which is to say not judged at all
+    ("/tmp/wipe.py", "import shutil\nshutil.rmtree('/var/lib/mysql')\n", guard.CONFIRM),
+    ("/tmp/ok.py", "#!/usr/bin/env python3\nprint('hello')\n", guard.ALLOW),
+]
+
+# A python script goes through the same rules the shell rules use, reached through
+# the calls that ask the system for something. (label, body, expected)
+PYTHON_BODIES: list[tuple[str, str, str]] = [
+    ("nothing that touches the system", "import json\nprint(json.dumps({'a': 1}))\n", guard.ALLOW),
+    # the point of the whole exercise: os.system is bash -c by another name
+    ("os.system with an rm of the data directory",
+     "import os\nos.system('rm -rf /var/lib/mysql')\n", guard.CONFIRM),
+    ("os.system with an mkfs",
+     "import os\nos.system('mkfs.ext4 /dev/vda1')\n", guard.BLOCK),
+    ("interactive adduser through subprocess",
+     "import subprocess\nsubprocess.run('adduser app_user', shell=True)\n", guard.BLOCK),
+    # aliases resolve, so renaming the module is not a way round the rules
+    ("an aliased import",
+     "import subprocess as sp\nsp.check_call('mkfs.xfs /dev/vdb', shell=True)\n", guard.BLOCK),
+    ("a from-import",
+     "from os import system\nsystem('dd if=/dev/zero of=/dev/vda')\n", guard.BLOCK),
+    # an argv list is the command with its words already separated
+    ("an argv list that is fine",
+     "import subprocess\nsubprocess.run(['systemctl', 'restart', 'mysql'], check=True)\n",
+     guard.ALLOW),
+    ("an argv list that is not",
+     "import subprocess\nsubprocess.run(['rm', '-rf', '/var/lib/mysql'])\n", guard.CONFIRM),
+    # one unreadable word in an otherwise readable command is not enough to stop for
+    ("an argv list with the SQL in a variable",
+     "import subprocess\nsql = build()\nsubprocess.run(['mysql', '-e', sql], check=True)\n",
+     guard.ALLOW),
+    # but a command that is nowhere written down cannot be judged at all
+    ("a command assembled before it is run",
+     "import subprocess\ncmd = build()\nsubprocess.run(cmd, shell=True)\n", guard.CONFIRM),
+    # f-strings and % and .format all fold down far enough to see the path
+    ("an f-string naming the data directory",
+     "import os\ndb = 'app'\nos.system(f'rm -rf /var/lib/mysql/{db}')\n", guard.CONFIRM),
+    ("percent formatting",
+     "import os\nos.system('rm -rf %s' % '/var/lib/mysql')\n", guard.CONFIRM),
+    ("str.format",
+     "import os\nos.system('rm -rf /var/lib/mysql/{}'.format(db))\n", guard.CONFIRM),
+    ("string concatenation",
+     "import os\nos.system('rm -rf ' + '/var/lib/mysql')\n", guard.CONFIRM),
+    # deletes and moves reach the same tables `rm` and `mv` are judged against
+    ("os.remove of a config file", "import os\nos.remove('/tmp/scratch')\n", guard.ALLOW),
+    ("shutil.rmtree of the data directory",
+     "import shutil\nshutil.rmtree('/var/lib/mysql')\n", guard.CONFIRM),
+    ("os.rename out of the data directory",
+     "import os\nos.rename('/var/lib/mysql', '/tmp/old')\n", guard.CONFIRM),
+    # a path built from values is a blind spot, and the same one a shell script has
+    ("a delete whose path cannot be read",
+     "import shutil\ntarget = pick()\nshutil.rmtree(target)\n", guard.ALLOW),
+    # writes go through the write_file rules, however the file is opened
+    ("open of an ordinary config for writing",
+     "with open('/etc/mysql/conf.d/z.cnf', 'w') as fh:\n    fh.write('[mysqld]\\n')\n", guard.ALLOW),
+    ("open of /etc/passwd for writing",
+     "open('/etc/passwd', 'w').write('')\n", guard.BLOCK),
+    ("open of /etc/passwd for reading, which changes nothing",
+     "print(open('/etc/passwd').read())\n", guard.ALLOW),
+    ("append to /etc/shadow",
+     "open('/etc/shadow', mode='a').write('x')\n", guard.BLOCK),
+    ("pathlib, which no rule about open() would see",
+     "from pathlib import Path\nPath('/etc/passwd').write_text('')\n", guard.BLOCK),
+    # SQL handed to a driver is the SQL inside `mysql -e`
+    ("a select", "cur.execute('SELECT COUNT(*) FROM app.users')\n", guard.ALLOW),
+    ("a drop database", "cur.execute('DROP DATABASE app')\n", guard.CONFIRM),
+    ("a drop through a cursor made on the spot",
+     "conn.cursor().execute('DROP USER app@localhost')\n", guard.CONFIRM),
+    # parameterised SQL: the statement is readable even though the values are not
+    ("a parameterised insert",
+     "cur.execute('INSERT INTO app.t (a) VALUES (%s)', (value,))\n", guard.ALLOW),
+    # text the guard cannot read is text it cannot judge
+    ("exec of decoded bytes",
+     "import base64\nexec(base64.b64decode(blob))\n", guard.BLOCK),
+    ("eval", "eval(payload)\n", guard.BLOCK),
+    ("__import__", "__import__('os').system('ls')\n", guard.BLOCK),
+    # stdin is /dev/null, so this raises EOFError rather than waiting
+    ("input", "pw = input('password: ')\n", guard.BLOCK),
+    ("getpass", "import getpass\npw = getpass.getpass()\n", guard.BLOCK),
+    ("pty.spawn", "import pty\npty.spawn('/bin/bash')\n", guard.BLOCK),
+    # sending, not fetching: a body leaving the server is the question
+    ("a POST", "import requests\nrequests.post('https://x/y', data=dump)\n", guard.CONFIRM),
+    ("a GET, which is what curl already does here",
+     "import requests\nr = requests.get('https://x/key.gpg')\n", guard.ALLOW),
+    # unreadable python is unjudgeable python, so none of it is copied
+    ("a syntax error", "def f(:\n    pass\n", guard.BLOCK),
+    ("a truncated reply", "import os\nos.system('apt-get install -y \n", guard.BLOCK),
 ]
 
 REPLIES: list[tuple[str, str, dict]] = [
@@ -611,6 +699,62 @@ REPLIES: list[tuple[str, str, dict]] = [
         "</html>\nCONTENT_END",
         {"action": "write_file", "content": "<html>\n<body>ok</body>\n</html>"},
     ),
+    (
+        "a bash script",
+        "THOUGHT: create both databases\nACTION: script\nINTERPRETER: bash\nSCRIPT_BEGIN\n"
+        "set -euo pipefail\nfor db in app logs; do\n  mysql -e \"CREATE DATABASE $db\"\ndone\n"
+        "SCRIPT_END",
+        {
+            "action": "script",
+            "interpreter": "bash",
+            "script": "set -euo pipefail\nfor db in app logs; do\n"
+                      "  mysql -e \"CREATE DATABASE $db\"\ndone",
+        },
+    ),
+    # No INTERPRETER: line, so the shebang decides. A model that writes one and
+    # leaves the key out has still said which language it means.
+    (
+        "a python script recognised by its shebang",
+        "ACTION: script\nSCRIPT_BEGIN\n#!/usr/bin/env python3\nprint('ok')\nSCRIPT_END",
+        {"action": "script", "interpreter": "python3"},
+    ),
+    ("neither an INTERPRETER: line nor a shebang, so bash",
+     "ACTION: script\nSCRIPT_BEGIN\nsystemctl is-active mysql\nSCRIPT_END",
+     {"action": "script", "interpreter": "bash"}),
+    # The spellings models actually use, all of which mean one of the two.
+    ("sh means bash here", "ACTION: script\nINTERPRETER: sh\nSCRIPT_BEGIN\nid\nSCRIPT_END",
+     {"interpreter": "bash"}),
+    ("/bin/bash is a spelling of bash",
+     "ACTION: script\nINTERPRETER: /bin/bash\nSCRIPT_BEGIN\nid\nSCRIPT_END",
+     {"interpreter": "bash"}),
+    ("python means python3",
+     "ACTION: script\nINTERPRETER: python\nSCRIPT_BEGIN\nprint(1)\nSCRIPT_END",
+     {"interpreter": "python3"}),
+    ("a versioned python",
+     "ACTION: script\nINTERPRETER: python3.12\nSCRIPT_BEGIN\nprint(1)\nSCRIPT_END",
+     {"interpreter": "python3"}),
+    ("LANG: as a spelling of INTERPRETER:",
+     "ACTION: script\nLANG: python3\nSCRIPT_BEGIN\nprint(1)\nSCRIPT_END",
+     {"interpreter": "python3"}),
+    # The INTERPRETER: line wins over a shebang that disagrees with it: the guard
+    # judged the body as one language, and that is the one that must run it.
+    ("INTERPRETER: overrides a contradicting shebang",
+     "ACTION: script\nINTERPRETER: bash\nSCRIPT_BEGIN\n#!/usr/bin/python3\nid\nSCRIPT_END",
+     {"interpreter": "bash"}),
+    # A line inside the body that looks like a key is part of the body.
+    ("keys inside a script body stay in the body",
+     "ACTION: script\nSCRIPT_BEGIN\necho 'PATH: /tmp'\n# SUMMARY: not a key\nSCRIPT_END",
+     {"script": "echo 'PATH: /tmp'\n# SUMMARY: not a key"}),
+    # The two BAD_REPLIES below refuse a command that carries the harness's own
+    # framing, because there it means the model ran past the end of its turn. A
+    # script prints things for a living, so the same words inside a body are the
+    # script's output and the step stands - the reason _STEP_RESTART and
+    # _FRAMING_ECHO are asked of the command only.
+    ("a script may print the harness's own words",
+     "ACTION: script\nSCRIPT_BEGIN\necho \"ACTION: failover done\"\n"
+     "echo \"STEP 3 RESULT: replica caught up\"\nSCRIPT_END",
+     {"action": "script", "interpreter": "bash",
+      "script": "echo \"ACTION: failover done\"\necho \"STEP 3 RESULT: replica caught up\""}),
 ]
 
 BAD_REPLIES: list[tuple[str, str]] = [
@@ -619,6 +763,12 @@ BAD_REPLIES: list[tuple[str, str]] = [
     ("run with no COMMAND", "ACTION: run\nTHOUGHT: install it"),
     ("write_file with no PATH", "ACTION: write_file\nCONTENT_BEGIN\nx\nCONTENT_END"),
     ("write_file with no body", "ACTION: write_file\nPATH: /tmp/a"),
+    ("script with no body", "ACTION: script\nINTERPRETER: bash"),
+    ("script with an empty body", "ACTION: script\nSCRIPT_BEGIN\n\nSCRIPT_END"),
+    # A third language is refused rather than guessed at: the guard has rules for
+    # shell and rules for python, and nothing to say about perl.
+    ("a language the guard cannot judge",
+     "ACTION: script\nINTERPRETER: perl\nSCRIPT_BEGIN\nprint 1;\nSCRIPT_END"),
     ("done with no SUMMARY", "ACTION: done\nVERIFY: systemctl is-active mysql"),
     ("an unknown action", "ACTION: reboot_server\nCOMMAND: reboot"),
     # The model wrote the harness's next message itself and glued the header onto
@@ -694,6 +844,13 @@ def main() -> int:
                 f"classify_file_content(<{path}>) -> {verdict.level} ({verdict.reason}), want {expected}"
             )
 
+    for label, body, expected in PYTHON_BODIES:
+        verdict = guard.classify_script_body(body, "python3")
+        if verdict.level != expected:
+            failures.append(
+                f"classify_script_body({label}) -> {verdict.level} ({verdict.reason}), want {expected}"
+            )
+
     for label, reply, expected in REPLIES:
         try:
             step = parse(reply)
@@ -720,7 +877,7 @@ def main() -> int:
         failures.append(f"parse({label}) should have failed, returned {step}")
 
     total = (len(COMMANDS) + len(FILE_WRITES) + len(FILE_BODIES) + len(SCRIPT_BODIES)
-             + len(REPLIES) + len(BAD_REPLIES))
+             + len(PYTHON_BODIES) + len(REPLIES) + len(BAD_REPLIES))
     print(f"{total - len(failures)}/{total} cases passed")
     for failure in failures:
         print(f"  FAIL {failure}")

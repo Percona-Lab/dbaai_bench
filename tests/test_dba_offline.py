@@ -18,6 +18,8 @@ PROJECT = Path(__file__).resolve().parents[1]  # the suites sit in tests/, the h
 sys.path.insert(0, str(PROJECT))
 
 from do_dba.agent import (
+    CHECK_DISCARDED,
+    CHECK_UNEXPLAINED,
     FILTER_EMPTY_NOTE,
     PIPE_CLOSED_NOTE,
     PIPE_CLOSED_VERIFY,
@@ -51,10 +53,15 @@ class ScriptedClient:
         self.costs = list(costs or [])
         self.calls = 0
         self.prompts: list[list[dict[str, str]]] = []
+        # What each reply was asked for, so a setting the agent quietly stopped
+        # passing on is a failing test rather than a bill nobody can explain.
+        self.efforts: list[str | None] = []
 
-    def complete(self, *, model, messages, temperature=None, max_tokens=None, on_note=None) -> Completion:
+    def complete(self, *, model, messages, temperature=None, max_tokens=None,
+                 effort=None, on_note=None) -> Completion:
         self.calls += 1
         self.prompts.append([dict(m) for m in messages])
+        self.efforts.append(effort)
         reply = self.replies.pop(0) if self.replies else "ACTION: abort\nSUMMARY: out of script"
         # A reply may be given as (text, finish_reason) to model one that the
         # service cut off at the output limit.
@@ -142,6 +149,27 @@ class FilteringDroplet(FakeDroplet):
         return result
 
 
+class SilentCheckDroplet(FakeDroplet):
+    """A server whose check fails and prints only the client's password warning.
+
+    Verbatim in shape from a recorded run, where `mysql -N -e "SELECT @@version LIKE
+    '9.7.%' AND @@gtid_mode='ON' AND @@require_secure_transport='ON' AND @@server_id=1"
+    | grep -q '^1$'` came back exit 1 with that one line and nothing else, on both
+    servers. The work was all there - the fourth conjunct compared a boolean system
+    variable to the string 'ON' - and the run spent two steps splitting the expression
+    apart by hand to find out which one was false. The fake pipes to nothing and knows
+    no system variables, so the shape is modelled here.
+    """
+
+    def run(self, command: str, timeout: float = 300.0) -> CommandResult:
+        result = super().run(command, timeout=timeout)
+        if "grep -q" in command:
+            return replace(result, exit_code=1, stderr="", stdout=(
+                "mysql: [Warning] Using a password on the command line interface "
+                "can be insecure.\n"))
+        return result
+
+
 class RefusingDroplet(FakeDroplet):
     """A 9.7 server: its client refuses `\\G`, its parser refuses `SHOW MASTER STATUS`.
 
@@ -189,7 +217,7 @@ def fleet_of(*droplets) -> Fleet:
 
 
 def build(droplet, store, replies, dry_run=False, approve=None, directory=None, mode="auto",
-          fleet=None, task="Install MySQL and PostgreSQL", costs=None):
+          fleet=None, task="Install MySQL and PostgreSQL", costs=None, effort=None):
     fleet = fleet if fleet is not None else fleet_of(droplet)
     record = RunRecord(
         directory=directory or (RUNS / ("dry" if dry_run else "main")),
@@ -216,6 +244,7 @@ def build(droplet, store, replies, dry_run=False, approve=None, directory=None, 
         mode=mode,
         dry_run=dry_run,
         limits=Limits(max_steps=20, command_timeout=300.0),
+        effort=effort,
     )
     return agent, record, client, events
 
@@ -252,6 +281,20 @@ def main() -> int:
 
     check(failures, outcome.status == "done", f"status is {outcome.status}, want done")
     check(failures, outcome.ok, "outcome should be ok")
+    # Nothing asked for thinking, so nothing should have been asked for. An
+    # effort is a per-request field and the loop makes one request per step, so
+    # "the agent forgot after the first" is a real way for this to go wrong.
+    check(failures, set(client.efforts) == {None},
+          f"a run that asked for no thinking asked anyway: {client.efforts}")
+    hard_agent, _, hard_client, _ = build(
+        FakeDroplet(), SecretStore(),
+        ["ACTION: run\nCOMMAND: apt-get update",
+         "ACTION: done\nVERIFY: systemctl is-active ssh\nSUMMARY: the lists are current"],
+        directory=RUNS / "thinking", effort="high",
+    )
+    hard_agent.run()
+    check(failures, hard_client.efforts and set(hard_client.efforts) == {"high"},
+          f"the effort did not reach every reply: {hard_client.efforts}")
 
     # the work actually happened
     check(failures, "mysql-server" in droplet.packages, "mysql-server was not installed")
@@ -508,6 +551,43 @@ def main() -> int:
                         for v in verify_record.verifications),
           f"the report does not mark the check unusable: "
           f"{[(v.command, v.exit_code, (v.output or '')[:40]) for v in verify_record.verifications]}")
+
+    # ------------------------------------------ a check that fails and says nothing
+    # Five of the seven failed checks in the recorded runs printed nothing that could
+    # explain them, and the exit code alone does not say which part of a combined
+    # check was false. This is the note that saves the steps the model otherwise
+    # spends taking its own expression apart.
+    silent_agent, silent_record, _, _ = build(
+        SilentCheckDroplet(), SecretStore(),
+        ["ACTION: done\nVERIFY: mysql -N -e \"SELECT @@gtid_mode='ON' AND @@server_id=1\" "
+         "| grep -q '^1$'\nSUMMARY: replication is configured on both servers"] * 4,
+        directory=RUNS / "silent-check",
+    )
+    silent = silent_agent.run()
+    silent_record.write_report()
+    check(failures, silent.status == "unverified",
+          f"a check that failed silently gave {silent.status}, want unverified")
+    unexplained = [m["content"] for m in silent_agent.messages
+                   if CHECK_UNEXPLAINED[:40] in m["content"]]
+    check(failures, unexplained,
+          "the model was told its check failed and nothing about why it could not read it")
+    check(failures, unexplained and CHECK_DISCARDED.strip()[:40] in unexplained[-1],
+          "the note did not name the shape that discarded the value")
+    # The warning is the only line the check printed, and it explains nothing - so the
+    # note has to fire in spite of the output not being empty.
+    check(failures, unexplained and "Using a password" in unexplained[-1],
+          "the check's own output was dropped from what the model was told")
+
+    # And where it must stay quiet: a failed check that did say why needs no lecture.
+    spoke_agent, _, _, _ = build(
+        FakeDroplet(), SecretStore(),
+        ["ACTION: done\nVERIFY: systemctl is-active mysql\nSUMMARY: mysql is up"] * 4,
+        directory=RUNS / "explained-check",
+    )
+    spoke_agent.run()
+    told = [m["content"] for m in spoke_agent.messages if CHECK_UNEXPLAINED[:40] in m["content"]]
+    check(failures, not told,
+          "a check that printed 'inactive' was still told it had explained nothing")
 
     # --------------------------------- a filter that ate the evidence (exit 1)
     # The other half of pipefail, and the harder half: exit 1 is both what a grep with
@@ -824,6 +904,121 @@ def main() -> int:
           f"the absorbed lines were not recorded: {continued}")
     check(failures, len(dropped) == 1 and dropped[0]["lines"] == ["That proves ssh survived it."],
           f"the lines left out of the command were not recorded: {dropped}")
+
+    # ------------------------------------------------------------- script steps
+    # A script is copied to the server and run there, so what has to hold is that
+    # its work lands, that the guard judged the whole body before any of it was
+    # copied, and that the model is told where the file is afterwards.
+    script_droplet = FakeDroplet()
+    script_store = SecretStore()
+    script_asked: list[str] = []
+
+    def script_approve(action, detail, reason):
+        script_asked.append(detail)
+        return True
+
+    script_agent, script_record, script_client, _ = build(
+        script_droplet, script_store,
+        [
+            "ACTION: run\nCOMMAND: apt-get update",
+            "ACTION: run\nCOMMAND: apt-get install -y mysql-server",
+            # A loop and a conditional, which is the case that has no one-line form.
+            "THOUGHT: create both databases and the user in one go\nACTION: script\n"
+            "INTERPRETER: bash\nSCRIPT_BEGIN\n#!/bin/bash\nset -euo pipefail\n"
+            "for db in app logs; do\n  mysql -e \"CREATE DATABASE IF NOT EXISTS $db\"\ndone\n"
+            "mysql -e \"CREATE USER 'svc'@'localhost' IDENTIFIED BY "
+            "'{{DBA_SECRET:mysql_svc}}'\"\nSCRIPT_END",
+            # Blocked whole: one line of it would hang, so none of it is copied and
+            # the two harmless lines above it must not have run either.
+            "ACTION: script\nSCRIPT_BEGIN\nsystemctl is-active mysql\n"
+            "mysql -e 'SELECT 1'\nmysql\nSCRIPT_END",
+            "ACTION: done\nVERIFY: systemctl is-active mysql\n"
+            "SUMMARY: both databases and the svc user exist",
+        ],
+        approve=script_approve, directory=RUNS / "script",
+    )
+    script_outcome = script_agent.run()
+    script_secrets = script_store.save(script_record.directory / "secrets.json")
+    script_report = script_record.write_report().read_text(encoding="utf-8")
+
+    check(failures, script_outcome.status == "done",
+          f"the script run gave {script_outcome.status}, want done")
+    check(failures, "app" in script_droplet.mysql.databases and "logs" in script_droplet.mysql.databases,
+          f"the loop in the script did not create both databases: {script_droplet.mysql.databases}")
+    check(failures, "svc@localhost" in script_droplet.mysql.users,
+          "the script did not create the user")
+
+    # The placeholder became a real password on the way out and nowhere else.
+    svc_password = script_store.resolve("{{DBA_SECRET:mysql_svc}}")
+    staged = script_droplet.files.get("/tmp/dba-harness/step03.sh", "")
+    check(failures, svc_password and svc_password in staged,
+          "the script that reached the server still held the placeholder")
+    check(failures, "{{DBA_SECRET:mysql_svc}}" in script_report and svc_password not in script_report,
+          "the report should keep the placeholder and not the password")
+    check(failures, script_secrets is not None
+          and svc_password in script_secrets.read_text(encoding="utf-8"),
+          "the script's generated password was not saved")
+    check(failures, not any(svc_password in m["content"] for m in script_agent.messages),
+          "the model was shown the password its script used")
+
+    # Nothing in that script is risky, so nothing was asked - the mode is auto and
+    # the guard allowed it. What is asked is checked below, where one is flagged.
+    check(failures, script_asked == [],
+          f"an allowed script should not have been offered for approval: {script_asked}")
+
+    # Blocked whole. The bare `mysql` is on the third line, and the two above it
+    # are harmless - a script judged line by line as it ran would have run them.
+    script_blocked = [m["content"] for m in script_agent.messages
+                      if "BLOCKED BY THE SAFETY GUARD" in m["content"]]
+    check(failures, len(script_blocked) == 1,
+          f"the script with a blocking line was not blocked: {len(script_blocked)}")
+    check(failures, script_blocked and "line 3 of the script" in script_blocked[0],
+          f"the model was not told which line stopped it: {script_blocked}")
+    check(failures, "/tmp/dba-harness/step04.sh" not in script_droplet.files,
+          "a blocked script was copied to the server anyway")
+    check(failures, not any(c.strip() == "mysql -e 'SELECT 1'" for c in script_droplet.commands),
+          "part of a blocked script ran")
+
+    # Where the file is, so a model that wants to read it back can.
+    check(failures, any("/tmp/dba-harness/step03.sh" in m["content"] for m in script_agent.messages),
+          "the model was never told where its script is on the server")
+    step_records = {step.index: step for step in script_record.steps}
+    check(failures, 3 in step_records and "for db in app logs" in step_records[3].detail,
+          "the transcript did not keep the script body")
+
+    # A python script is judged as python, which is the whole reason the two are
+    # told apart: read as shell this is a file of unknown program names.
+    py_droplet = FakeDroplet()
+    py_asked: list[tuple[str, str]] = []
+    py_agent, py_record, _, _ = build(
+        py_droplet, SecretStore(),
+        [
+            "ACTION: script\nINTERPRETER: python3\nSCRIPT_BEGIN\nimport shutil\n"
+            "shutil.rmtree('/var/lib/mysql')\nSCRIPT_END",
+            "ACTION: script\nINTERPRETER: python3\nSCRIPT_BEGIN\npw = input('root password: ')\n"
+            "print(pw)\nSCRIPT_END",
+            "ACTION: abort\nSUMMARY: nothing worked out",
+        ],
+        approve=lambda action, detail, reason: py_asked.append((action, detail)) or False,
+        directory=RUNS / "python-script",
+    )
+    py_agent.run()
+    py_record.write_report()
+    py_steps = {step.index: step for step in py_record.steps}
+    # The operator declines it, and what they declined was the script itself: a
+    # summary line would be approving something they were never shown.
+    check(failures, py_asked and py_asked[0][0] == "script"
+          and "shutil.rmtree('/var/lib/mysql')" in py_asked[0][1],
+          f"the script body was not what the operator was shown: {py_asked}")
+    check(failures, 1 in py_steps and py_steps[1].verdict == "confirm",
+          f"rmtree of the data directory should have been offered: {py_steps.get(1)}")
+    check(failures, 1 in py_steps and "/var/lib/mysql" in (py_steps[1].verdict_reason or ""),
+          f"the reason did not name the data directory: {py_steps.get(1)}")
+    check(failures, 2 in py_steps and py_steps[2].verdict == "block",
+          f"input() on a closed stdin should have been blocked: {py_steps.get(2)}")
+    staged_here = [path for path in py_droplet.files if path.startswith("/tmp/dba-harness/")]
+    check(failures, staged_here == [],
+          f"a declined and a blocked script were copied to the server anyway: {staged_here}")
 
     # ------------------------------------------------- unparseable model output
     junk_droplet = FakeDroplet()

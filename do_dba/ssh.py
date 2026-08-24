@@ -3,6 +3,10 @@
 Every command is wrapped so it cannot sit waiting for a human — stdin is
 /dev/null and DEBIAN_FRONTEND is set — because a prompt on the far end would
 otherwise hang the run until the timeout.
+
+A script is a file rather than a command: staged over SFTP, parsed on the far end
+without being run, then run by naming its interpreter. It is still one step, and
+its result comes back in the same CommandResult a command's does.
 """
 
 from __future__ import annotations
@@ -38,6 +42,41 @@ SYNTAX_ERROR_NOTE = (
     "as a loop or a heredoc, belongs between COMMAND_BEGIN and COMMAND_END rather than "
     "on a COMMAND: line, which holds one line only."
 )
+# Where scripts land. Under /tmp because it is writable without sudo on every
+# image this runs against, and one directory rather than scattered files so that a
+# run leaves one thing to look at afterwards.
+SCRIPT_DIR = "/tmp/dba-harness"
+SCRIPT_SYNTAX_ERROR_NOTE = (
+    "harness: {interpreter} could not parse the script, so none of it ran. The script is "
+    "on the server at {path} if you want to look at it. Send the step again with the "
+    "syntax fixed."
+)
+_SCRIPT_SUFFIX = {"python3": ".py"}
+
+
+def script_path(index: int, interpreter: str) -> str:
+    """Where step number `index` will be written on the server.
+
+    Numbered by step rather than hashed or made unique, so that the path in the
+    model's reply, the path in the transcript and the path on the server are one
+    and the same, and a re-sent step overwrites its own file instead of leaving a
+    directory of near-identical scripts to tell apart.
+    """
+    return f"{SCRIPT_DIR}/step{index:02d}{_SCRIPT_SUFFIX.get(interpreter, '.sh')}"
+
+
+def script_check(path: str, interpreter: str) -> str:
+    """The command that parses the script without running any of it.
+
+    PYTHONDONTWRITEBYTECODE so py_compile checks the syntax without leaving a
+    __pycache__ beside the script for whoever looks at the directory afterwards.
+    """
+    check = (
+        f"python3 -m py_compile {shlex.quote(path)}"
+        if interpreter == "python3"
+        else f"bash -n {shlex.quote(path)}"
+    )
+    return f"PYTHONDONTWRITEBYTECODE=1 {check}"
 
 
 class SSHError(RuntimeError):
@@ -264,6 +303,84 @@ class SSHRunner:
                 return out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), truncated, True
             if not moved:
                 time.sleep(0.05)
+
+    def run_script(
+        self,
+        body: str,
+        interpreter: str = "bash",
+        index: int = 1,
+        timeout: float = DEFAULT_COMMAND_TIMEOUT,
+    ) -> CommandResult:
+        """Copy a script to the far end and run it there, as one step.
+
+        Run by naming the interpreter - `bash /tmp/dba-harness/step03.sh` - rather
+        than by making the file executable and calling it. That way the execute bit
+        is never needed, which matters because /tmp is mounted noexec on hardened
+        images, and the interpreter is the one the guard judged the script as
+        rather than whatever the shebang happens to say.
+
+        Mode 0700, set before the body is written and not after: a script may carry
+        a password that a {{DBA_SECRET:...}} placeholder stood for until this
+        moment, and it sits in a world-readable directory for as long as it takes
+        to run.
+
+        The parse pass first, for the reason wrap_command gives: an interpreter
+        reads a script as it goes, so a quote left open at the bottom runs
+        everything above it and only then fails, half-applying a step that was
+        approved whole. Neither `bash -n` nor py_compile executes anything.
+
+        Nothing of the harness's own is injected into the body - no pipefail, no
+        `set -e`. What runs on the server is byte for byte what was judged, and
+        what the model wants of its shell it writes at the top itself.
+        """
+        started = time.monotonic()
+        path = script_path(index, interpreter)
+        payload = body.encode("utf-8")
+
+        try:
+            sftp = self._client.open_sftp()  # type: ignore[union-attr]
+        except (paramiko.SSHException, OSError) as exc:
+            raise SSHError(f"could not open SFTP on {self.host}: {exc}") from exc
+        try:
+            try:
+                sftp.mkdir(SCRIPT_DIR, 0o700)
+            except OSError:
+                pass  # already there, which is the usual case after the first script
+            with sftp.open(path, "wb") as handle:
+                handle.write(payload)
+            sftp.chmod(path, 0o700)
+        except OSError as exc:
+            return CommandResult(
+                command=f"{interpreter} {path}",
+                exit_code=1,
+                stdout="",
+                stderr=f"harness: could not copy the script to {path} on the server: {exc}",
+                duration=time.monotonic() - started,
+            )
+        finally:
+            sftp.close()
+
+        parsed = self.run(script_check(path, interpreter), timeout=60)
+        if parsed.exit_code != 0 and not parsed.timed_out:
+            note = SCRIPT_SYNTAX_ERROR_NOTE.format(interpreter=interpreter, path=path)
+            return CommandResult(
+                command=f"{interpreter} {path}",
+                exit_code=2,
+                stdout="",
+                stderr=f"{parsed.stderr.strip()}\n{note}".strip(),
+                duration=time.monotonic() - started,
+            )
+
+        result = self.run(f"{interpreter} {shlex.quote(path)}", timeout=timeout)
+        return CommandResult(
+            command=f"{interpreter} {path}",
+            exit_code=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            duration=time.monotonic() - started,
+            timed_out=result.timed_out,
+            output_truncated=result.output_truncated,
+        )
 
     # ----------------------------------------------------------------- files
 

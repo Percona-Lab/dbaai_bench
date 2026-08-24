@@ -18,7 +18,7 @@ from .agent import MODE_AUTO, MODE_PLAN, MODE_STEP, MODE_UNATTENDED, DBAAgent, L
 from .fleet import Fleet, parse_target
 from .inference import providers
 from .inference.catalog import Catalog
-from .inference.client import InferenceClient, InferenceError
+from .inference.client import EFFORTS, InferenceClient, InferenceError
 from .inference.config import ConfigError, load_dotenv
 from .inference.pricing import PriceBook, format_cost, format_rate, from_records
 from .report import HostInfo, RunRecord, run_directory
@@ -414,6 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
     limits.add_argument("--max-cost", type=float, default=None, metavar="USD",
                         help="stop once model spend reaches this")
     limits.add_argument("--temperature", type=float, default=0.2, help="sampling temperature (default: 0.2)")
+    limits.add_argument("--effort", choices=EFFORTS, default=None,
+                        help="ask the model to think before each step, where it can be "
+                             "asked - the gateway turns this into whatever the model wants. "
+                             "Thinking is billed as output, so a high effort costs "
+                             "several times a step that did none. Unset asks for nothing, "
+                             "which leaves a reasoning model reasoning as it always does")
 
     output = parser.add_argument_group("output")
     output.add_argument("--runs-dir",
@@ -642,6 +648,7 @@ def _run(args, screen: Screen, fleet: Fleet, client, catalog, prices, provider, 
         dry_run=args.dry_run,
         limits=limits,
         temperature=args.temperature,
+        effort=args.effort,
         persist=persist_secrets if keep_on_servers else None,
     )
 

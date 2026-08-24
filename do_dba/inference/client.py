@@ -79,11 +79,27 @@ class Chunk:
 # directly, so it still answers "what did this run cost me here".
 COST_ACCOUNTING = {"usage": {"include": True}}
 
+# How much thinking to ask for. The gateway maps one word onto whatever the
+# upstream model wants - a token budget for Anthropic, a reasoning_effort for
+# OpenAI - which is why an effort travels where a per-provider knob would not.
+# Nothing is sent unless an effort is asked for: a model that thinks by default
+# goes on thinking, and one that does not is not made to pay for it.
+EFFORTS = ("low", "medium", "high")
+
+
+def reasoning_body(effort: str | None) -> dict[str, Any]:
+    """The body extension that asks a model to think, or nothing."""
+    return {"reasoning": {"effort": effort}} if effort else {}
+
 
 # Parameters that some hosted models reject outright. When a model complains we
 # retry without it rather than forcing the user to know which knobs each model
 # supports (reasoning models, for instance, refuse temperature and top_p).
 _DROPPABLE_PARAMS = ("temperature", "top_p", "stream_options")
+
+# The same, for the two body extensions. They travel inside extra_body rather
+# than at the top level, so dropping one edits that dict and not the request.
+_DROPPABLE_EXTRAS = ("usage", "reasoning")
 
 
 class InferenceClient:
@@ -150,6 +166,7 @@ class InferenceClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
+        effort: str | None = None,
         on_note: Callable[[str], None] | None = None,
     ) -> Iterator[Chunk]:
         """Stream a chat completion, yielding Chunks as they arrive."""
@@ -165,7 +182,7 @@ class InferenceClient:
             params["top_p"] = top_p
         if max_tokens is not None:
             params["max_tokens"] = max_tokens
-        params.update(self._accounting())
+        params.update(self._extensions(effort))
 
         stream = self._create(params, on_note=on_note)
 
@@ -227,6 +244,7 @@ class InferenceClient:
         messages: list[dict[str, str]],
         temperature: float | None = None,
         max_tokens: int | None = None,
+        effort: str | None = None,
         on_note: Callable[[str], None] | None = None,
     ) -> Completion:
         """One whole reply, not streamed - for agent loops that parse the text."""
@@ -235,7 +253,7 @@ class InferenceClient:
             params["temperature"] = temperature
         if max_tokens is not None:
             params["max_tokens"] = max_tokens
-        params.update(self._accounting())
+        params.update(self._extensions(effort))
 
         response = self._create(params, on_note=on_note)
         choice = (getattr(response, "choices", None) or [None])[0]
@@ -253,20 +271,30 @@ class InferenceClient:
             id=getattr(response, "id", "") or "",
         )
 
-    def _accounting(self) -> dict[str, Any]:
-        """The body extension that asks the gateway what the reply cost.
+    def _extensions(self, effort: str | None = None) -> dict[str, Any]:
+        """The body fields that are gateway extensions, not OpenAI parameters.
 
-        extra_body rather than a named parameter: it is not part of the OpenAI
-        schema, so the SDK would refuse it as a keyword and pass it through here.
+        extra_body rather than named parameters: they are not part of the OpenAI
+        schema, so the SDK would refuse them as keywords and pass them through
+        here. Both in one dict, because a second `extra_body` would replace the
+        first rather than join it - a run that asked for thinking would stop
+        asking what it cost.
         """
-        return {"extra_body": dict(COST_ACCOUNTING)} if self.usage_accounting else {}
+        extra: dict[str, Any] = {}
+        if self.usage_accounting:
+            extra.update(COST_ACCOUNTING)
+        extra.update(reasoning_body(effort))
+        return {"extra_body": extra} if extra else {}
 
     def _create(self, params: dict[str, Any], on_note: Callable[[str], None] | None):
         """Send the request, retrying once per parameter the model rejects."""
         attempt = dict(params)
         already_fixed: set[str] = set()
 
-        for _ in range(len(_DROPPABLE_PARAMS) + 2):
+        # One attempt per fix there could be, and one more to send the request
+        # that finally has none left: a model that refuses everything droppable
+        # still gets asked the question.
+        for _ in range(len(_DROPPABLE_PARAMS) + len(_DROPPABLE_EXTRAS) + 2):
             try:
                 return self._client.chat.completions.create(**attempt)
             except AuthenticationError as exc:
@@ -298,6 +326,7 @@ _FIX_NOTES = {
     "drop:stream_options": "this model does not report token usage while streaming",
     "drop:usage": "this gateway does not report what a reply cost - "
                   "the cost line will be worked out from published rates",
+    "drop:reasoning": "this model cannot be asked to think harder - sent without an effort",
     "rename:max_tokens": "this model wants max_completion_tokens - renamed automatically",
 }
 
@@ -311,13 +340,14 @@ def _diagnose_bad_request(message: str, params: dict[str, Any], already_fixed: s
         if candidate not in already_fixed:
             return candidate
 
-    # The cost report is an extension, so a gateway that never heard of it is
-    # entitled to refuse the request outright. Losing the exact figure is worth a
-    # retry; losing the reply is not.
-    if "usage" in lowered and params.get("extra_body", {}).get("usage") is not None:
-        candidate = "drop:usage"
-        if candidate not in already_fixed:
-            return candidate
+    # Both extensions are extensions, so a gateway that never heard of one is
+    # entitled to refuse the request outright. Losing the exact cost figure, or
+    # the thinking, is worth a retry; losing the reply is not.
+    for name in _DROPPABLE_EXTRAS:
+        if name in lowered and params.get("extra_body", {}).get(name) is not None:
+            candidate = f"drop:{name}"
+            if candidate not in already_fixed:
+                return candidate
 
     for name in _DROPPABLE_PARAMS:
         if name in lowered and name in params:
@@ -330,9 +360,11 @@ def _diagnose_bad_request(message: str, params: dict[str, Any], already_fixed: s
 def _apply_fix(fix: str, params: dict[str, Any]) -> dict[str, Any]:
     updated = dict(params)
     action, name = fix.split(":", 1)
-    if fix == "drop:usage":
+    if action == "drop" and name in _DROPPABLE_EXTRAS:
+        # The other extension stays: a gateway that refuses one has said nothing
+        # about the other.
         extra = {key: value for key, value in updated.get("extra_body", {}).items()
-                 if key != "usage"}
+                 if key != name}
         updated = {key: value for key, value in updated.items() if key != "extra_body"}
         if extra:
             updated["extra_body"] = extra

@@ -5,7 +5,9 @@ Behaviours exercised:
   * POST /v1/chat/completions  -> SSE stream + trailing usage chunk
   * the same with stream unset -> one whole JSON reply, which is what the harness
                                   asks for: it parses a reply, it does not show one
-  * model "picky-model"        -> 400 on temperature (tests param fallback)
+  * model "picky-model"        -> 400 on temperature and on reasoning, one at a
+                                  time, which is what a model that refuses more
+                                  than one parameter does (tests param fallback)
   * model "reasoner-1"         -> emits reasoning_content
   * model "router:general"     -> reports a different served model, as a router does
   * prompt containing "CACHED" -> usage reports prompt_tokens_details.cached_tokens
@@ -71,11 +73,13 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         model = body.get("model", "")
 
-        if model == "picky-model" and "temperature" in body:
-            return self._json(
-                400,
-                {"error": {"message": "Unsupported value: 'temperature' is not supported with this model."}},
-            )
+        # One complaint per reply, as a real service gives: the client is expected
+        # to drop what it was told about and ask again, not to guess the rest.
+        if model == "picky-model":
+            for unwanted in ("temperature", "reasoning"):
+                if unwanted in body:
+                    return self._json(400, {"error": {"message":
+                        f"Unsupported value: '{unwanted}' is not supported with this model."}})
 
         want_usage = bool((body.get("stream_options") or {}).get("include_usage"))
         prompt = ""

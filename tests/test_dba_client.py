@@ -6,7 +6,8 @@ client does with what comes back from a DigitalOcean-shaped service: a whole
 non-streamed reply (which is what the harness asks for - it parses replies, it
 does not display them), a stream, the reasoning field under either of its two
 names, the served model a router alias reports, cached prompt tokens, and the
-retry that drops a parameter the model refuses.
+retry that drops a parameter the model refuses - including a model that refuses
+two of them, which is the case the retry budget is sized for.
 
     uv run python run_tests.py client
 
@@ -76,6 +77,30 @@ def main() -> int:
           f"the retry without temperature did not succeed: {picky.text!r}")
     check(failures, any("temperature" in note for note in notes),
           f"the operator was not told what was dropped: {notes}")
+
+    # Two refusals in one request, one complaint at a time - which is the case the
+    # retry budget has to be big enough for. An effort is not a parameter but a
+    # body extension, so dropping it edits extra_body rather than the request.
+    fussed: list[str] = []
+    both = client.complete(
+        model="picky-model",
+        messages=[{"role": "user", "content": "ping"}],
+        temperature=0.7,
+        effort="high",
+        on_note=fussed.append,
+    )
+    check(failures, "You said: ping" in both.text,
+          f"a model that refuses two things never got asked: {both.text!r}")
+    check(failures, len(fussed) == 2 and any("think harder" in note for note in fussed),
+          f"the effort was not dropped and reported: {fussed}")
+
+    # And a model that accepts it is sent it: the stub echoes the prompt, so what
+    # proves the ask travelled is that nothing was dropped on the way.
+    quiet: list[str] = []
+    asked = client.complete(model="reasoner-1", messages=[{"role": "user", "content": "hm"}],
+                            effort="low", on_note=quiet.append)
+    check(failures, not quiet and asked.reasoning.strip() == "Let me think about that.",
+          f"asking a reasoning model to think was not clean: {quiet}")
 
     # ---------------------------------------------------------------- streaming
     chunks = list(client.stream_chat(

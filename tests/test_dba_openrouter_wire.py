@@ -183,6 +183,7 @@ def main() -> int:
             model=MODEL,
             messages=[{"role": "user", "content": "ping"}],
             temperature=0.2,
+            effort="high",
         )
         check(failures, reply.text.strip() == "pong", f"the reply did not come back: {reply.text!r}")
         check(failures, reply.usage.get("prompt_tokens") == 1200, "usage was not read")
@@ -201,6 +202,11 @@ def main() -> int:
             # The one line that makes the cost line reconcilable with the bill.
             check(failures, sent.get("usage") == {"include": True},
                   f"the request did not ask what the reply cost: {sent.get('usage')!r}")
+            # And the ask for thinking, in the same body: both are extensions
+            # travelling through one extra_body, so this is where a second one
+            # replacing the first would show up rather than in a unit test.
+            check(failures, sent.get("reasoning") == {"effort": "high"},
+                  f"the effort did not reach the wire: {sent.get('reasoning')!r}")
 
         print("completion done", flush=True)
         # ------------------------------- a whole run, priced by the gateway
@@ -255,6 +261,14 @@ def main() -> int:
               and billed_events[0]["cost_source"] == "gateway"
               and abs(billed_events[0]["cost"] - CHARGED) < 1e-12,
               f"the per-reply cost was not logged as the gateway's: {billed_events}")
+
+        # The agent was built without an effort, so its own requests must carry no
+        # reasoning block at all: an unasked-for effort would change what every
+        # existing run costs, and "off" is the absence of the field rather than a
+        # word meaning none.
+        agent_posts = [json.loads(r["body"]) for r in REQUESTS if r["method"] == "POST"][1:]
+        check(failures, agent_posts and all("reasoning" not in sent for sent in agent_posts),
+              f"a run that asked for no effort sent one anyway: {len(agent_posts)} request(s)")
 
         # A bad key must be reported as OpenRouter's rejection, not DigitalOcean's.
         check(failures, "OpenRouter rejected" in client._rejected(),

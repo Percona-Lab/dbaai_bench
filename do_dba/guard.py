@@ -3,6 +3,12 @@
 Three outcomes: ALLOW runs it, CONFIRM needs a human to say yes, BLOCK never
 runs and is fed back to the model so it can pick another approach.
 
+A file being written and a script being run go through the same rules. A shell
+script is judged line by line, so `rm -rf /var/lib/mysql` is the same event
+wherever it is written down; a python script is parsed and judged by its calls,
+which is a separate set of rules further down because read as shell a python file
+is line after line of unknown program names.
+
 This is a safety net over a well-known set of footguns, not a sandbox. The model
 is driving a root shell; a determined or unlucky sequence of individually
 harmless commands can still break a server. Read the plan.
@@ -10,6 +16,7 @@ harmless commands can still break a server. Read the plan.
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
 from dataclasses import dataclass
@@ -555,15 +562,41 @@ def classify_file_content(content: str, path: str = "") -> Verdict:
             return Verdict(CONFIRM, reason)
     # Writing a script and then running it would otherwise slip every command
     # rule, since the write is just bytes and the run is just a path.
-    if looks_like_script(content, path):
-        return classify_script(content)
+    kind = script_kind(content, path)
+    if kind:
+        return classify_script_body(content, kind)
     return Verdict(ALLOW)
 
 
+def script_kind(content: str, path: str = "") -> str:
+    """Which interpreter would read this file: "python3", "bash", or "" for neither.
+
+    Asked of a file body because a script reaching the server as bytes and then
+    being run by name is the same event as a command, and has to be judged like
+    one. Python is named separately rather than lumped in with shell: judged as
+    shell a Python script reads as line after line of unknown programs, which is
+    to say it is not judged at all.
+    """
+    first = content.lstrip().splitlines()[0] if content.strip() else ""
+    if first.startswith("#!"):
+        return "python3" if "python" in first.lower() else "bash"
+    clean = path.strip().lower()
+    if clean.endswith(".py"):
+        return "python3"
+    if clean.endswith((".sh", ".bash", ".zsh")):
+        return "bash"
+    return ""
+
+
 def looks_like_script(content: str, path: str = "") -> bool:
-    if content.lstrip().startswith("#!"):
-        return True
-    return path.strip().endswith((".sh", ".bash", ".zsh"))
+    return bool(script_kind(content, path))
+
+
+def classify_script_body(body: str, interpreter: str = "bash") -> Verdict:
+    """Judge a whole script, by the interpreter that will read it."""
+    if "python" in (interpreter or "").lower():
+        return classify_python_script(body)
+    return classify_script(body)
 
 
 # Lines that are shell structure rather than a command to judge.
@@ -578,9 +611,13 @@ def classify_script(body: str) -> Verdict:
 
     Line by line rather than whole-body, because several rules are written with
     `[^|;&]*` and would otherwise match across unrelated lines.
+
+    The line number is in the reason because a script is not a command: told only
+    that something in sixty lines drops a database, an operator has to find it,
+    and the model has to guess which line to rewrite.
     """
     worst = Verdict(ALLOW)
-    for line in body.splitlines():
+    for number, line in enumerate(body.splitlines(), start=1):
         if _SCRIPT_NOISE.match(line):
             continue
         # No quote check here: a string in a script may legitimately open on one
@@ -589,12 +626,343 @@ def classify_script(body: str) -> Verdict:
         verdict = classify(line, _quotes=False)
         if verdict.level == ALLOW:
             continue
-        reason = f"line {line.strip()[:80]!r} in the script: {verdict.reason}"
+        reason = f"line {number} of the script, {line.strip()[:80]!r}: {verdict.reason}"
         if verdict.level == BLOCK:
             return Verdict(BLOCK, reason)
         if worst.level == ALLOW:
             worst = Verdict(CONFIRM, reason)
     return worst
+
+
+# ------------------------------------------------------------------- python
+#
+# Every set below is a dotted name as it resolves after imports, so `sp.run` and
+# `from subprocess import run` both arrive here as subprocess.run.
+
+# Calls that hand a string to a shell. What they are given is classified as the
+# command it is - the same treatment `bash -c` already gets - because without it
+# python is a way past every rule above, and the script action would be a hole
+# rather than a feature.
+_PY_SHELL = {
+    "os.system", "os.popen",
+    "os.execl", "os.execlp", "os.execv", "os.execvp", "os.execve",
+    "os.spawnl", "os.spawnv", "os.spawnlp", "os.spawnvp",
+    "subprocess.run", "subprocess.call", "subprocess.check_call",
+    "subprocess.check_output", "subprocess.Popen",
+    "subprocess.getoutput", "subprocess.getstatusoutput",
+}
+# Deletes and moves, mapped onto the very tables the rm and mv rules use, so that
+# a python script and a shell script are told the same thing about /var/lib/mysql.
+_PY_REMOVE = {"os.remove", "os.unlink", "os.rmdir", "os.removedirs"}
+_PY_REMOVE_TREE = {"shutil.rmtree"}
+_PY_MOVE = {"shutil.move", "os.rename", "os.renames", "os.replace"}
+# Sends data somewhere else. Deliberately not every network call: fetching a
+# package or a repository key is ordinary work, and requests.get is the same event
+# as the curl this harness recommends. What is asked about is a body leaving.
+_PY_SEND = {
+    "requests.post", "requests.put", "requests.patch",
+    "smtplib.SMTP", "ftplib.FTP", "paramiko.SSHClient", "paramiko.Transport",
+}
+# Runs text the guard cannot see, so nothing below can judge it. A DBA script has
+# no need of any of these, and `exec(base64.b64decode(...))` is the shape this
+# stops being able to reason about at all.
+_PY_OPAQUE = {"eval", "exec", "compile", "__import__",
+              "builtins.eval", "builtins.exec", "builtins.compile"}
+# Asks the operator something. These do not hang the way an editor does - with
+# stdin on /dev/null, input() raises EOFError on the spot - but the script still
+# cannot do what it was written to do, and the traceback is a poor way to find out.
+_PY_ASKS = {"input", "raw_input", "getpass.getpass"}
+_PY_INTERACTIVE = {"pty.spawn", "os.forkpty"}
+# Where a database driver is handed SQL. The receiver is a cursor or a connection
+# whose name cannot be known, so these are matched on the method name alone - the
+# SQL is what gets judged, exactly as it is inside `mysql -e`.
+_PY_SQL = {"execute", "executemany", "executescript"}
+# Stands in for a part of a string the guard cannot work out. A bare word, chosen
+# so that `rm -rf /var/lib/mysql/DBAUNKNOWN` still reads as a delete under the
+# data directory while `rm -rf DBAUNKNOWN` does not read as a path at all.
+_PY_UNKNOWN = "DBAUNKNOWN"
+_PY_PERCENT = re.compile(r"%[-#0 +]*\d*(?:\.\d+)?[sdrfgxi]")
+_PY_BRACES = re.compile(r"\{[^{}]*\}")
+
+
+def classify_python_script(body: str) -> Verdict:
+    """Judge a python script by what it asks the system to do.
+
+    Parsed rather than pattern-matched, and the parse is itself the first
+    judgement: a script this cannot read is a script whose danger it cannot
+    assess, which is the same reason an unclosed quote is refused above.
+    ast.parse builds a tree and executes nothing.
+
+    What is judged is the calls, each mapped onto a rule that already exists: a
+    string on its way to a shell is classified as a command, a delete against the
+    same path tables as `rm`, a move as `mv`, a file opened for writing by
+    classify_file_write, and SQL handed to a driver as the SQL in `mysql -e`. The
+    strictest verdict wins, and the line number comes with it.
+
+    Two blind spots, both deliberate. A path the parser cannot fold -
+    os.remove(target), where target was built earlier - is not caught, which is
+    the same blindness `mv "$DATA" "${DATA}.old"` has in a shell script and is
+    documented on _judge_move. A whole command that cannot be read -
+    subprocess.run(cmd) - asks the operator instead of passing quietly: that is
+    an instruction stream the guard cannot see, which is what `curl | sh` is, and
+    it is treated the same way. A fragment it can partly read is not enough to
+    ask about, so subprocess.run(["mysql", "-e", sql]) goes straight through.
+
+    pathlib is covered for writes - Path("/etc/passwd").write_text(...) - but not
+    for deletes: Path(x).unlink() names its path on an object, and the object is
+    what the parser cannot follow.
+    """
+    try:
+        tree = ast.parse(body)
+    except SyntaxError as exc:
+        where = f" at line {exc.lineno}" if exc.lineno else ""
+        return Verdict(BLOCK, f"this is not valid python{where}: {exc.msg}. None of it could be "
+                              "judged, so none of it was copied to the server - fix the syntax "
+                              "and send it again")
+    except (ValueError, RecursionError) as exc:
+        return Verdict(BLOCK, f"this python could not be parsed, so it could not be judged: {exc}")
+
+    bound = _python_bindings(tree)
+    worst = Verdict(ALLOW)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        verdict = _judge_python_call(node, bound)
+        if verdict.level == ALLOW:
+            continue
+        reason = f"line {node.lineno} of the script, {verdict.reason}"
+        if verdict.level == BLOCK:
+            return Verdict(BLOCK, reason)
+        if worst.level == ALLOW:
+            worst = Verdict(CONFIRM, reason)
+    return worst
+
+
+def _python_bindings(tree: ast.AST) -> dict[str, str]:
+    """The names the script binds to modules, so `sp.run` resolves to subprocess.run."""
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                # `import os.path` binds os; `import subprocess as sp` binds sp.
+                bound[alias.asname or root] = alias.name if alias.asname else root
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                bound[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return bound
+
+
+def _python_dotted(func: ast.expr, bound: dict[str, str]) -> str:
+    """The dotted name being called, with imported aliases resolved."""
+    parts: list[str] = []
+    node = func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return ""  # called on a value - connect().cursor() - so there is no module to name
+    parts.append(node.id)
+    parts.reverse()
+    return ".".join([bound.get(parts[0], parts[0]), *parts[1:]])
+
+
+def _judge_python_call(call: ast.Call, bound: dict[str, str]) -> Verdict:
+    dotted = _python_dotted(call.func, bound)
+    # The method name on its own, which is all there is when the receiver is a
+    # value: cursor.execute(...) and connect().cursor().execute(...) both land here.
+    if isinstance(call.func, ast.Attribute):
+        tail = call.func.attr
+    elif isinstance(call.func, ast.Name):
+        tail = call.func.id
+    else:
+        tail = ""
+
+    if dotted in _PY_OPAQUE:
+        return Verdict(BLOCK, f"{dotted}() runs text the guard cannot read, so what it would do "
+                              "on the server cannot be judged before it does it; write the work "
+                              "out in full instead")
+    if dotted in _PY_ASKS:
+        return Verdict(BLOCK, f"{dotted}() waits for an answer, and stdin is /dev/null here, so "
+                              "it raises EOFError instead of ever getting one; take the value "
+                              "from the script itself")
+    if dotted in _PY_INTERACTIVE:
+        return Verdict(BLOCK, f"{dotted}() starts an interactive session and would hang until "
+                              "the step timeout")
+    if dotted in _PY_SHELL:
+        return _judge_python_shell(dotted, call)
+    if dotted in _PY_REMOVE or dotted in _PY_REMOVE_TREE:
+        return _judge_python_delete(dotted, call, recursive=dotted in _PY_REMOVE_TREE)
+    if dotted in _PY_MOVE:
+        return _judge_python_move(dotted, call)
+    if dotted in _PY_SEND:
+        return Verdict(CONFIRM, f"{dotted}() sends data off this server")
+    if dotted in {"open", "io.open", "codecs.open"}:
+        return _judge_python_open(call)
+    if tail in {"write_text", "write_bytes"}:
+        return _judge_python_pathlib_write(call, bound)
+    if tail in _PY_SQL:
+        return _judge_python_sql(call)
+    return Verdict(ALLOW)
+
+
+def _judge_python_shell(dotted: str, call: ast.Call) -> Verdict:
+    """A string on its way to a shell, classified as the command it is."""
+    if not call.args:
+        return Verdict(ALLOW)
+    text, _ = _python_text(call.args[0])
+    if not text.replace(_PY_UNKNOWN, "").strip():
+        # Nothing of the command is written down, so there is nothing to judge and
+        # no way to know what will run. The operator is asked rather than told
+        # afterwards; see the note on classify_python_script.
+        return Verdict(CONFIRM, f"{dotted}() is handed a command that is built rather than "
+                                "written out, so the guard cannot see what will run on the "
+                                "server; read the script and decide")
+    verdict = classify(text, _quotes=False)
+    if verdict.level == ALLOW:
+        return Verdict(ALLOW)
+    return Verdict(verdict.level, f"{dotted}() runs {text.strip()[:80]!r}: {verdict.reason}")
+
+
+def _judge_python_delete(dotted: str, call: ast.Call, recursive: bool) -> Verdict:
+    """A delete, judged against the same path tables as `rm`."""
+    if not call.args:
+        return Verdict(ALLOW)
+    path, _ = _python_text(call.args[0])
+    if not path.strip():
+        return Verdict(ALLOW)
+    verdict = _judge_rm(["-rf", path] if recursive else [path])
+    if verdict.level == ALLOW:
+        return Verdict(ALLOW)
+    return Verdict(verdict.level, f"{dotted}({path!r}): {verdict.reason}")
+
+
+def _judge_python_move(dotted: str, call: ast.Call) -> Verdict:
+    """A move, judged as `mv` is: a delete of the source, a write of the target."""
+    paths = [_python_text(argument)[0] or _PY_UNKNOWN for argument in call.args[:2]]
+    if len(paths) < 2 or not any(path != _PY_UNKNOWN for path in paths):
+        return Verdict(ALLOW)
+    verdict = _judge_move(paths)
+    if verdict.level == ALLOW:
+        return Verdict(ALLOW)
+    return Verdict(verdict.level, f"{dotted}({paths[0]!r}, {paths[1]!r}): {verdict.reason}")
+
+
+def _judge_python_open(call: ast.Call) -> Verdict:
+    """A file opened for writing, judged exactly as a write_file step would be."""
+    if not call.args:
+        return Verdict(ALLOW)
+    path, _ = _python_text(call.args[0])
+    mode = ""
+    if len(call.args) > 1:
+        mode, _ = _python_text(call.args[1])
+    for keyword in call.keywords:
+        if keyword.arg == "mode":
+            mode, _ = _python_text(keyword.value)
+    if not any(letter in mode for letter in "wax+"):
+        return Verdict(ALLOW)  # opened for reading, which changes nothing
+    return _judge_written_path(path, f"opens {path.strip()} for writing")
+
+
+def _judge_python_pathlib_write(call: ast.Call, bound: dict[str, str]) -> Verdict:
+    """Path("/etc/passwd").write_text(...), which no rule above would see."""
+    receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+    if not isinstance(receiver, ast.Call):
+        return Verdict(ALLOW)
+    if _python_dotted(receiver.func, bound) not in {"pathlib.Path", "Path", "pathlib.PurePath"}:
+        return Verdict(ALLOW)
+    if not receiver.args:
+        return Verdict(ALLOW)
+    path, _ = _python_text(receiver.args[0])
+    return _judge_written_path(path, f"writes {path.strip()}")
+
+
+def _judge_written_path(path: str, description: str) -> Verdict:
+    """One absolute path about to be written, put through the write_file rules."""
+    if not path.strip().startswith("/"):
+        # Relative, or built from values the parser cannot fold. classify_file_write
+        # would refuse it for not being absolute, which is not what is being asked.
+        return Verdict(ALLOW)
+    verdict = classify_file_write(path)
+    if verdict.level == ALLOW:
+        return Verdict(ALLOW)
+    return Verdict(verdict.level, f"{description}: {verdict.reason}")
+
+
+def _judge_python_sql(call: ast.Call) -> Verdict:
+    """SQL handed to a driver, judged as the SQL inside `mysql -e` already is."""
+    if not call.args:
+        return Verdict(ALLOW)
+    text, _ = _python_text(call.args[0])
+    if not text.replace(_PY_UNKNOWN, "").strip():
+        return Verdict(ALLOW)
+    verdict = classify(text, _quotes=False)
+    if verdict.level == ALLOW:
+        return Verdict(ALLOW)
+    return Verdict(verdict.level, f"executes {text.strip()[:80]!r}: {verdict.reason}")
+
+
+def _python_text(node: ast.expr) -> tuple[str, bool]:
+    """The string this expression stands for, and whether all of it could be read.
+
+    A part the parser cannot fold - a name, a call, an f-string's `{db}` - becomes
+    _PY_UNKNOWN rather than abandoning the whole string, so that
+    `f"rm -rf /var/lib/mysql/{db}"` is still recognisably a delete under the data
+    directory. Nothing is evaluated here: this reads the tree, it does not run it.
+    """
+    if isinstance(node, ast.Constant):
+        return (node.value, True) if isinstance(node.value, str) else (str(node.value), True)
+    if isinstance(node, ast.JoinedStr):  # an f-string
+        parts, whole = [], True
+        for value in node.values:
+            text, known = _python_text(value)
+            parts.append(text)
+            whole = whole and known
+        return "".join(parts), whole
+    if isinstance(node, ast.FormattedValue):  # the {...} of an f-string
+        return _PY_UNKNOWN, False
+    if isinstance(node, (ast.List, ast.Tuple)):
+        # An argv list, which is the command with its words already separated.
+        words, whole = [], True
+        for element in node.elts:
+            text, known = _python_text(element)
+            words.append(text)
+            whole = whole and known
+        return " ".join(words), whole
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, left_known = _python_text(node.left)
+        right, right_known = _python_text(node.right)
+        return left + right, left_known and right_known
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):  # "rm -rf %s" % path
+        values = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+        return _fill(_PY_PERCENT, _python_text(node.left), values)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+            and node.func.attr == "format":  # "rm -rf {}".format(path)
+        return _fill(_PY_BRACES, _python_text(node.func.value), node.args)
+    if isinstance(node, ast.Name):
+        return _PY_UNKNOWN, False
+    return "", False
+
+
+def _fill(holes: re.Pattern, template: tuple[str, bool], values: list[ast.expr]) -> tuple[str, bool]:
+    """A template with its arguments put back into it, in order.
+
+    `"rm -rf %s" % path` and `"rm -rf {}".format(path)` are the same sentence as the
+    f-string, and a literal argument is as readable as a literal in the template
+    itself - so the substitution is done rather than every hole written off as
+    unknown. An argument that cannot be read leaves _PY_UNKNOWN behind, and so does
+    a hole with no argument to fill it: `%(name)s` against a dict has none.
+    """
+    text, whole = template
+    supplied = iter(_python_text(value) for value in values)
+
+    def one(_match: re.Match) -> str:
+        nonlocal whole
+        filled, known = next(supplied, (_PY_UNKNOWN, False))
+        whole = whole and known
+        return filled
+
+    return holes.sub(one, text), whole
 
 
 def _tokens(segment: str) -> list[str]:

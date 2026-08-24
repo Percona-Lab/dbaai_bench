@@ -15,6 +15,7 @@ from .protocol import (
     DONE,
     RESULT_HEADER,
     RUN,
+    SCRIPT,
     Check,
     ProtocolError,
     Step,
@@ -25,7 +26,7 @@ from .protocol import (
 )
 from .report import RunRecord, StepRecord, Verification
 from .secrets import SecretStore, env_name
-from .ssh import SSHError
+from .ssh import SSHError, script_path
 
 # Independent of anything the model claims, these run at the end.
 DEFAULT_VERIFICATIONS = [
@@ -135,6 +136,43 @@ PIPE_CLOSED_VERIFY = (
     "there. Send the check again without the truncating pipe: a VERIFY is judged on "
     "its exit code."
 )
+# The other way a check comes back unreadable, and the commoner one: it fails, and
+# nothing in its output says which part of it was false. Five of the seven failed
+# checks in the recorded runs are like this, across three separate runs, and four
+# threw the answer away themselves - `| grep -q '^1$'`, `test "$(...)" = "1"`. One
+# collapsed four facts into a single boolean with SQL `AND`, so exit 1 could not say
+# which of the four was wrong, and that run spent two steps taking its own expression
+# apart by hand - `SELECT @@require_secure_transport, @@require_secure_transport='ON'`
+# - to find that a boolean system variable reads back as 1 and so never equals the
+# string 'ON'. The harness cannot know which fact failed either. What it does know is
+# that the check said nothing and what shape it had, and that is the part the model
+# has had to work out for itself each time.
+CHECK_UNEXPLAINED = (
+    "harness: that check failed without printing anything that says why.{shape} A VERIFY "
+    "is judged on its exit code, so this is not wrong in itself - but a failure you cannot "
+    "read costs a step to take apart, and nothing on this side can see which part was "
+    "false either. Do not send it again unchanged. Send a run step that prints the values "
+    "the check looked at - `mysql -e 'SELECT @@gtid_mode, @@server_id'` rather than one "
+    "combined boolean - read which of them is wrong, then send done again with one VERIFY "
+    "line per fact, so that the next failure names itself."
+)
+CHECK_DISCARDED = (
+    " `grep -q`, `test` and a `>/dev/null` keep the value to themselves, and one command "
+    "joining several facts with `AND` or `&&` cannot report which of them is false."
+)
+# What the client prints on 59 of the recorded checks and never explains. A check
+# whose only output is this printed nothing at all, as far as its failure goes.
+CHECK_NOISE = re.compile(r"^\s*\w+: \[Warning\] Using a password on the command line")
+# The shapes that answer with an exit code and keep the value. Uppercase AND only,
+# which is how models write SQL; a lowercase one costs the extra sentence, not the note.
+CHECK_DISCARDS = re.compile(
+    r"\b(?:z?e?grep)\b[^|]*(?:\s-\w*q\b|--quiet|--silent)"  # grep -q, piped or not
+    r"|(?:^|[;&|]\s*)test\s"                                 # test "$(...)" = "1"
+    # The answer sent nowhere. Stdout only: `2>/dev/null` throws the diagnosis away,
+    # which is a reason the check said nothing but not a reason it kept its value.
+    r"|(?<![02-9&])>\s*/dev/null"
+    r"|\s(?:&&|AND)\s"                                       # several facts, one exit code
+)
 
 
 def pipe_closed_early(result) -> bool:
@@ -193,6 +231,28 @@ def filter_matched_nothing(result) -> bool:
     if result.stdout.strip() or result.stderr.strip():
         return False  # something got through the filter, so 1 came from further up
     return any(not QUIET_GREP.search(flags) for flags in GREP_STAGE.findall(command))
+
+
+def check_explains_nothing(output: str) -> bool:
+    """Did a failed check come back with nothing that could say why it failed?
+
+    Asked of the output rather than of the command, because a check that keeps its
+    value is only a problem once it fails: `test "$(...)" = "1"` that passes has
+    nothing left to explain.
+    """
+    return not any(line.strip() and not CHECK_NOISE.match(line)
+                   for line in (output or "").splitlines())
+
+
+def unexplained_check_note(command: str) -> str:
+    """What to hand back for a check that failed and said nothing.
+
+    The shape sentence only when the shape is there, so the note does not name
+    `grep -q` to a model that did not write one.
+    """
+    return CHECK_UNEXPLAINED.format(
+        shape=CHECK_DISCARDED if CHECK_DISCARDS.search(command) else "")
+
 
 # How much the operator is asked, from most to least. The loop below only cares
 # about MODE_STEP, which adds a prompt to steps the guard did not flag; the rest
@@ -254,6 +314,7 @@ class DBAAgent:
         dry_run: bool = False,
         limits: Limits | None = None,
         temperature: float | None = 0.2,
+        effort: str | None = None,
         verifications: list[str] | None = None,
         persist: Callable[[], None] | None = None,
     ):
@@ -270,6 +331,10 @@ class DBAAgent:
         self.dry_run = dry_run
         self.limits = limits or Limits()
         self.temperature = temperature
+        # How hard to think, where the model can be told. None asks for nothing,
+        # which is not the same as asking for none: a reasoning model still
+        # reasons, at whatever the gateway's default for it is.
+        self.effort = effort
         self.verifications = DEFAULT_VERIFICATIONS if verifications is None else verifications
         # Called when a step has just brought a new credential into being, so it can
         # be put somewhere it survives this process. See secrets.write_keeper.
@@ -304,7 +369,11 @@ TASK
 {self.spec}
 
 RULES
-1. One step per reply, then wait for the result before choosing the next.
+1. One step per reply, then wait for the result before choosing the next. When the
+   work genuinely needs more than one command - a loop, a retry, a check whose answer
+   decides the next command - make it an ACTION: script instead of chaining commands
+   with && across three lines. It is copied to the server and run there, and its exit
+   code, stdout and stderr come back exactly as a command's do.
 2. Nothing interactive: stdin is /dev/null. Use -y with apt-get, --no-pager with
    systemctl, mysql -e '...', psql -c '...', mongosh --eval '...' and valkey-cli
    with the command on the same line. Editors, pagers, bare REPLs, a server started
@@ -331,16 +400,25 @@ RULES
    Ubuntu's archive, so add the vendor repository with its key in
    /usr/share/keyrings and signed-by in the sources line, then apt-get update
    before installing - apt cannot see a repository it has not fetched.
-9. Each command is killed after {self.limits.command_timeout:.0f}s. A slow apt install is fine;
-   design steps that finish inside that.
+9. Each command is killed after {self.limits.command_timeout:.0f}s, and a script gets the same
+   {self.limits.command_timeout:.0f}s for all of it together. A slow apt install is fine; design steps
+   that finish inside that.
 10. Finish with ACTION: done, one VERIFY: line per thing the task asked for, and a
     SUMMARY covering what changed, the state of each service, and where credentials
     went. Each VERIFY command must exit non-zero if the work is not really there;
     the harness re-runs them all, and a done step with none is handed straight back.
+    Have each one print what it looked at as well, and keep it to one fact per line:
+    `mysql -e 'SELECT @@gtid_mode, @@server_id'` beats the same values joined by AND
+    into one boolean and piped into `grep -q`, which fails without saying which of
+    them was wrong. Note also that a boolean system variable reads back as 1 or 0, so
+    `@@read_only='ON'` is false on a server that has it on.
 {self._fleet_rules()}
 A safety guard inspects every step first. Destructive commands are blocked - you are
-told why and should choose another route - and risky ones pause for a human. You have
-at most {self.limits.max_steps} steps."""
+told why and should choose another route - and risky ones pause for a human. A script
+is judged whole, before any of it is copied to the server, so one blocked line stops
+all of it and you are told which line. Write the commands out in the script rather
+than assembling them at run time: a command the guard cannot read is a command it has
+to stop and ask about. You have at most {self.limits.max_steps} steps."""
 
     def _credentials(self) -> str:
         """The credentials these servers already hold, by name and never by value.
@@ -390,7 +468,7 @@ at most {self.limits.max_steps} steps."""
     any assignment that satisfies the task is a good one, and changing your mind
     halfway is what breaks these runs.
 """
-        return """11. Every run and write_file step says which server it is for on a HOST: line.
+        return """11. Every run, script and write_file step says which server it is for on a HOST: line.
     Nothing is broadcast: one step runs on one server and you get that server's
     result back before the next step. Work through the servers one at a time.
 12. The PRIVATE NETWORK note above says what the servers can reach each other on;
@@ -605,7 +683,7 @@ at most {self.limits.max_steps} steps."""
                 consecutive_failures = 0
             elif not closed_pipe:
                 consecutive_failures += 1
-            self._observe(self._format_result(index, result, target))
+            self._observe(self._format_result(index, result, target, step))
 
             if consecutive_failures >= self.limits.max_consecutive_failures:
                 return self._finish(
@@ -707,6 +785,7 @@ at most {self.limits.max_steps} steps."""
                 model=self.model,
                 messages=messages,
                 temperature=self.temperature,
+                effort=self.effort,
                 on_note=lambda note: self.emit("note", note),
             )
         except InferenceError as exc:
@@ -738,6 +817,13 @@ at most {self.limits.max_steps} steps."""
     def _judge(self, step: Step) -> tuple[guard.Verdict, str]:
         if step.action == RUN:
             return guard.classify(step.command), step.command
+        if step.action == SCRIPT:
+            # The whole body is the detail, because the whole body is what is being
+            # approved. A summary line would put the operator in the position of
+            # saying yes to something they were not shown, and the body is what
+            # goes into the record for the same reason.
+            detail = f"{step.describe()}\n{step.script}"
+            return guard.classify_script_body(step.script, step.interpreter), detail
         detail = f"{step.path} (mode {step.mode}, {len(step.content)} bytes)"
         verdict = guard.classify_file_write(step.path)
         if verdict.level == guard.ALLOW:
@@ -755,6 +841,14 @@ at most {self.limits.max_steps} steps."""
                 self.emit("run", self._where(target) + step.command)
                 return target.runner.run(
                     self.store.resolve(step.command), timeout=self.limits.command_timeout
+                )
+            if step.action == SCRIPT:
+                self.emit("run", f"{self._where(target)}{step.describe()}")
+                return target.runner.run_script(
+                    self.store.resolve(step.script),
+                    interpreter=step.interpreter,
+                    index=index,
+                    timeout=self.limits.command_timeout,
                 )
             self.emit("run", f"{self._where(target)}write {step.path}")
             return target.runner.write_file(
@@ -787,13 +881,21 @@ at most {self.limits.max_steps} steps."""
                 parts.append(self.store.redact(tail[-1].strip())[:160])
         return " - ".join(parts)
 
-    def _format_result(self, index: int, result, target: Target) -> str:
+    def _format_result(self, index: int, result, target: Target, step: Step | None = None) -> str:
         limit = self.limits.max_output_chars
         parts = [RESULT_HEADER.format(index=index)]
         if self.fleet.many:
             # Named on its own line, so a model reading back through the
             # observations can see which server each result came from.
             parts.append(f"server: {target.name}")
+        if step is not None and step.action == SCRIPT:
+            # Named because the file stays there: a model that wants to run the
+            # script again, or read it, or fix one line of it with sed, needs to
+            # know where it is, and the alternative is that it guesses.
+            parts.append(
+                f"the script is on the server at {script_path(index, step.interpreter)} "
+                f"and was run with: {step.interpreter} {script_path(index, step.interpreter)}"
+            )
         parts.append(f"exit code: {result.exit_code} ({result.duration:.1f}s)")
         if pipe_closed_early(result):
             # Straight after the exit code, because it is the exit code that needs
@@ -898,9 +1000,15 @@ at most {self.limits.max_steps} steps."""
             self.record.event("verification", host=target.name, command=command,
                               exit_code=result.exit_code, output=output[:2000])
             if result.exit_code != 0 or result.timed_out:
-                broken.append(
-                    f"$ {where}{command}\nexit {result.exit_code}\n"
-                    f"{output.strip()[:600] or '(no output)'}")
+                said = [f"$ {where}{command}", f"exit {result.exit_code}",
+                        output.strip()[:600] or "(no output)"]
+                # Not for a timeout, where the silence is the clock rather than the
+                # shape of the check, and not for the harness's own checks, which are
+                # not the model's to rewrite.
+                if (not result.timed_out and command not in self.verifications
+                        and check_explains_nothing(output)):
+                    said.append(unexplained_check_note(command))
+                broken.append("\n".join(said))
         return broken
 
     def _finish(self, status: str, summary: str, steps: int, executed: int) -> Outcome:

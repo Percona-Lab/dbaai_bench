@@ -17,6 +17,14 @@ that adds a sentence of prose still parses.
     bind-address = 127.0.0.1
     CONTENT_END
 
+    ACTION: script
+    INTERPRETER: bash
+    SCRIPT_BEGIN
+    #!/bin/bash
+    set -euo pipefail
+    for db in app logs; do mysql -e "CREATE DATABASE IF NOT EXISTS $db"; done
+    SCRIPT_END
+
     ACTION: done
     VERIFY: systemctl is-active mysql
     SUMMARY: what changed and how it was checked
@@ -30,6 +38,13 @@ are read as part of the command when its first line cannot stand alone, and a
 whole script sent that way is refused. What is neither is recorded as not run:
 dropping a command's second half in silence is the one thing that must not happen
 here, because the shell reports success on the half it received.
+
+A script is its own action rather than a command that happens to be long, because
+what has to happen to it is different: it is copied to the server as a file and
+run there by name, so INTERPRETER: decides which interpreter reads it and the
+guard has to judge the whole body before any of it is copied. bash and python3
+are the two, spelled however the model spells them; with no INTERPRETER: line the
+shebang decides, and with neither it is bash.
 """
 
 from __future__ import annotations
@@ -41,9 +56,26 @@ from dataclasses import dataclass, field
 
 RUN = "run"
 WRITE_FILE = "write_file"
+SCRIPT = "script"
 DONE = "done"
 ABORT = "abort"
-ACTIONS = {RUN, WRITE_FILE, DONE, ABORT}
+ACTIONS = {RUN, WRITE_FILE, SCRIPT, DONE, ABORT}
+
+# The two interpreters a script step may ask for, and the spellings that reach
+# them. Models write `sh`, `shell`, `python`, `py` and `python3.11` for these two
+# things; refusing a spelling costs a round trip and teaches nothing, so the
+# aliases resolve and only a third language is an error.
+BASH = "bash"
+PYTHON = "python3"
+_INTERPRETER_ALIASES = {
+    "bash": BASH, "sh": BASH, "shell": BASH, "zsh": BASH, "dash": BASH, "ksh": BASH,
+    "/bin/bash": BASH, "/bin/sh": BASH, "/usr/bin/bash": BASH,
+    "python": PYTHON, "python3": PYTHON, "py": PYTHON, "python2": PYTHON,
+    "/usr/bin/python3": PYTHON, "/usr/bin/env python3": PYTHON,
+}
+# `python3.11`, `python3.12` and so on, which no alias table can enumerate.
+_PYTHON_VERSIONED = re.compile(r"^/?(?:usr/bin/)?python\s*3(?:\.\d+)*$")
+_SCRIPT_EXTENSIONS = {".sh": BASH, ".bash": BASH, ".zsh": BASH, ".py": PYTHON}
 
 _SPEC = """Reply with exactly one step, in this format and nothing else:
 
@@ -67,6 +99,16 @@ CONTENT_BEGIN
 file contents
 CONTENT_END
 
+ACTION: script              (a script, copied to the server and run there)
+{write_host}INTERPRETER: bash           (bash or python3; optional, default bash)
+SCRIPT_BEGIN
+#!/bin/bash
+set -euo pipefail
+for db in app logs; do
+  mysql -e "CREATE DATABASE IF NOT EXISTS $db"
+done
+SCRIPT_END
+
 ACTION: done                (the task is complete and verified)
 VERIFY: a read-only command proving it - at least one, repeat the line for more
 {scoped}SUMMARY: what you changed, what state things are in now, where credentials went
@@ -76,7 +118,10 @@ SUMMARY: why, and what you tried
 
 COMMAND: holds one line. A loop, a heredoc or anything else that spans lines goes
 between COMMAND_BEGIN and COMMAND_END, and a file's contents are better written
-with write_file than with a heredoc. Never send two steps in one reply.{tail}"""
+with write_file than with a heredoc. Several commands that belong together, or
+anything needing real control flow, belong in ACTION: script - it is copied to the
+server and run there in one step, and you get its exit code, stdout and stderr
+back exactly as for a command. Never send two steps in one reply.{tail}"""
 
 
 def spec(hosts=()) -> str:
@@ -96,10 +141,10 @@ def spec(hosts=()) -> str:
         write_host=f"HOST: {names[-1]}\n",
         scoped=f"VERIFY: [{names[-1]}] a check to run on that server only\n",
         tail=(
-            "\n\nEvery run and write_file step needs a HOST: line naming the server it is for -\n"
-            f"one of: {listed}. A step without one, or with any other name, is refused\n"
-            "and comes back to you unrun; nothing is guessed. A VERIFY: line with no [name]\n"
-            "runs on every server."
+            "\n\nEvery run, script and write_file step needs a HOST: line naming the server it\n"
+            f"is for - one of: {listed}. A step without one, or with any other name, is\n"
+            "refused and comes back to you unrun; nothing is guessed.\n"
+            "A VERIFY: line with no [name] runs on every server."
         ),
     )
 
@@ -109,12 +154,13 @@ SPEC = spec()
 
 _KEYS = {
     "thought", "action", "command", "content", "path", "mode", "summary", "verify",
-    "explanation", "reason", "host",
+    "explanation", "reason", "host", "script", "interpreter", "lang", "language",
 }
 _BLOCKS = {
     "command_begin": ("command", "command_end"),
     "content_begin": ("content", "content_end"),
     "summary_begin": ("summary", "summary_end"),
+    "script_begin": ("script", "script_end"),
 }
 _KEY_LINE = re.compile(r"^\s{0,4}([A-Za-z_]{3,20})\s*:\s*(.*)$")
 # The two keys a step opens with, and so the only ones that can end a command
@@ -126,7 +172,7 @@ _FENCE = re.compile(r"^\s*```")
 # Models fall into YAML habits and write `COMMAND: |` with the body indented
 # below. Taken literally that runs a bare pipe, so the block is read instead.
 _YAML_BLOCK = re.compile(r"[|>][-+]?\d*$")
-_MULTILINE_KEYS = {"command", "content", "summary"}
+_MULTILINE_KEYS = {"command", "content", "summary", "script"}
 
 # A single-line COMMAND: whose one line cannot be the whole command. Models write
 # loops and heredocs under it constantly, and every line but the first used to be
@@ -181,6 +227,16 @@ _FRAMING_ECHO = re.compile(r"STEP\s+\d+\s+RESULT")
 # would catch `echo "PATH: $PATH"` and `MODE: 0644` in an ordinary diagnostic,
 # and no run has ever shown a step restarting at one of them. Add a key here when
 # one does, not before.
+#
+# Both patterns are asked of a command and not of a SCRIPT_BEGIN body, for the
+# same reason _inside_content leaves control markers there alone: the body is a
+# file, so an overrunning model's prose arrives as extra lines under the script
+# rather than glued into the middle of the command it was writing, the lines that
+# were approved are still the lines that run, and the interpreter's parse pass
+# refuses whatever does not parse. A forty-line script also has honest reason to
+# write these words - `echo "ACTION: failover done"` in a report - where a
+# one-line command does not. A recorded run whose script overran is what would
+# justify widening this; there is none yet.
 _STEP_RESTART = re.compile(r"(THOUGHT|ACTION)\s*:")
 
 
@@ -215,6 +271,8 @@ class Step:
     path: str = ""
     mode: str = "0644"
     content: str = ""
+    script: str = ""       # the body of an ACTION: script step
+    interpreter: str = ""  # bash or python3, resolved; empty for every other action
     summary: str = ""
     verify: list[Check] = field(default_factory=list)
     host: str = ""  # the server this step is for, as that server is named
@@ -231,6 +289,9 @@ class Step:
             return self.command
         if self.action == WRITE_FILE:
             return f"write {self.path} ({len(self.content)} bytes, mode {self.mode})"
+        if self.action == SCRIPT:
+            lines = len(self.script.splitlines())
+            return f"{self.interpreter} script ({lines} lines, {len(self.script)} bytes)"
         return self.action
 
 
@@ -244,8 +305,9 @@ def strip_control_tokens(reply: str) -> str:
     turning each token into a newline, which keeps the keys at the start of their
     lines where the parser looks for them.
 
-    Markers inside a CONTENT_BEGIN block are left alone. There the text is a file
-    body, not shell, and a model asked to write a prompt template means them.
+    Markers inside a CONTENT_BEGIN or SCRIPT_BEGIN block are left alone. There the
+    text is a file body or a script, not shell the harness is about to run word for
+    word, and a model asked to write a prompt template means them.
     """
     cleaned = _strip_trailing_tag(reply)
     first = _CONTROL_TOKEN.search(cleaned)
@@ -280,9 +342,15 @@ def _strip_trailing_tag(reply: str) -> str:
 
 
 def _inside_content(head: str) -> bool:
-    """Whether the text ends inside an open CONTENT_BEGIN block."""
+    """Whether the text ends inside an open CONTENT_BEGIN or SCRIPT_BEGIN block.
+
+    A script body gets the same treatment as a file body for the same reason: the
+    text there is not shell the harness is about to run word for word, so a marker
+    in it may well be something the model meant to write.
+    """
     lowered = head.lower()
-    return lowered.rfind("content_begin") > lowered.rfind("content_end")
+    return (lowered.rfind("content_begin") > lowered.rfind("content_end")
+            or lowered.rfind("script_begin") > lowered.rfind("script_end"))
 
 
 def parse(reply: str, fleet=None) -> Step:
@@ -381,10 +449,17 @@ def parse(reply: str, fleet=None) -> Step:
     command = fields.get("command", "").strip()
     trimmed = _strip_trailing_tag(command)
 
+    script_body = fields.get("script", "")
     step = Step(
         action=action,
         thought=fields.get("thought", ""),
         command=trimmed,
+        script=script_body,
+        interpreter=_interpreter(
+            fields.get("interpreter") or fields.get("lang") or fields.get("language", ""),
+            script_body,
+            fields.get("path", ""),
+        ) if action == SCRIPT else "",
         # Quotes around a path belong to shell syntax, not to the name; left in
         # they create a file whose name really does contain them.
         path=fields.get("path", "").strip().strip("'\"`").strip(),
@@ -428,6 +503,12 @@ def parse(reply: str, fleet=None) -> Step:
                 "COMMAND_END instead, and use ACTION: write_file for a file's contents. If they "
                 "were commentary, send the step again without them."
             )
+    if action == SCRIPT and not step.script.strip():
+        raise ProtocolError(
+            "ACTION: script needs the script itself between SCRIPT_BEGIN and SCRIPT_END. "
+            "Nothing was run. Send the step again with the body in that block, and an "
+            "INTERPRETER: line of bash or python3."
+        )
     if action == WRITE_FILE:
         if not step.path:
             raise ProtocolError("ACTION: write_file needs a PATH: line with an absolute path.")
@@ -441,6 +522,42 @@ def parse(reply: str, fleet=None) -> Step:
         step.mode = "0644"
 
     return step
+
+
+def _interpreter(spelling: str, body: str, path: str = "") -> str:
+    """Which interpreter reads this script: bash or python3.
+
+    Asked in three places in turn, because a model that has said which language
+    this is has usually said it somewhere. The INTERPRETER: line is the answer
+    when there is one; a shebang is the model saying the same thing in the script
+    itself, and it is what the far end would honour if the file were executable;
+    a PATH:-style extension is the last hint. With none of them it is bash, which
+    is what a step full of shell commands almost always is.
+
+    A third language is refused rather than run as one of these two: `perl` read
+    as bash is a screenful of syntax errors, and the round trip that says so is
+    cheaper than the one that does not explain itself.
+    """
+    said = (spelling or "").strip().strip("`'\"").lower()
+    if said:
+        resolved = _INTERPRETER_ALIASES.get(said)
+        if resolved is None and _PYTHON_VERSIONED.match(said):
+            resolved = PYTHON
+        if resolved is None:
+            raise ProtocolError(
+                f"INTERPRETER: {spelling.strip()!r} is not one this harness can run, so nothing "
+                f"was run. It is {BASH} or {PYTHON}. Send the step again with one of those, or "
+                "write the work as shell commands."
+            )
+        return resolved
+
+    shebang = body.lstrip().splitlines()[0] if body.strip() else ""
+    if shebang.startswith("#!"):
+        return PYTHON if "python" in shebang.lower() else BASH
+    for extension, interpreter in _SCRIPT_EXTENSIONS.items():
+        if path.strip().lower().endswith(extension):
+            return interpreter
+    return BASH
 
 
 def _resolve_host(spelling: str, action: str, fleet) -> str:
