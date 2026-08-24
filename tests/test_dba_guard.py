@@ -44,6 +44,13 @@ COMMANDS: list[tuple[str, str]] = [
     # `apt-get -s install` simulates: nothing changes, so nothing prompts.
     ("apt-get -s install mysql-server | tail -50", guard.ALLOW),
     ("DEBIAN_FRONTEND=noninteractive apt-get --simulate install postgresql", guard.ALLOW),
+    # `--print-uris` is the other lookahead: it prints the .deb URLs and returns
+    # before apt reaches its prompt, having taken no lock and unpacked nothing.
+    # The first of these is the line from the recorded run this was found in.
+    ("apt-get install --print-uris percona-server-server 2>/dev/null | grep -E 'http'",
+     guard.ALLOW),
+    ("apt-get --print-uris install mysql-server", guard.ALLOW),
+    ("apt install mysql-server", guard.BLOCK),
     ("apt-get install mysql-server", guard.BLOCK),
     # A quote left open means bash runs the lines before the break and then
     # fails, half-applying a step - and the guard's idea of where one command
@@ -359,6 +366,15 @@ SCRIPT_BODIES: list[tuple[str, str, str]] = [
     # the hole this closes: interactive adduser smuggled inside a script
     ("/usr/local/bin/setup.sh", "#!/bin/bash\nadduser app_user\n", guard.BLOCK),
     ("/tmp/install.sh", "apt-get install mysql-server\n", guard.BLOCK),
+    # the shape of the recorded script that found the --print-uris false positive:
+    # a survey of where a package would come from, which installs nothing
+    (
+        "/tmp/survey.sh",
+        "#!/bin/bash\nset -uo pipefail\nexport DEBIAN_FRONTEND=noninteractive\n"
+        "apt-cache policy percona-server-server 2>&1 | head -n 12\n"
+        "apt-get install --print-uris percona-server-server 2>/dev/null | grep -E 'http'\n",
+        guard.ALLOW,
+    ),
     ("/tmp/wipe.sh", "#!/bin/sh\nrm -rf /var/lib/mysql\n", guard.CONFIRM),
     # no extension, but the shebang gives it away
     ("/usr/local/bin/dbsetup", "#!/usr/bin/env bash\nmysql -e 'DROP DATABASE app'\n", guard.CONFIRM),

@@ -417,10 +417,16 @@ def _judge_segment(segment: str, depth: int = 0) -> Verdict:
     # A package install that was not told to assume yes will stop at the first
     # prompt, and stdin is closed, so it fails in a confusing way.
     if program in {"apt", "apt-get", "aptitude"} and _has_word(args, "install"):
-        # -s prints what would happen and changes nothing, so there is no prompt
-        # to stall on: blocking it would refuse the safest way to look ahead.
-        simulate = {"-s", "--simulate", "--dry-run", "--just-print", "--no-act", "--recon"}
-        if not _any_flag(args, {"-y", "--yes", "--assume-yes", "-q", "-qq"} | simulate):
+        # Unless it is not really an install. -s prints what would happen, and
+        # --print-uris prints the .deb URLs it would fetch; both change nothing and
+        # both return before apt reaches its prompt, so there is nothing to stall
+        # on, and blocking them refuses the cheapest way to look ahead - which
+        # repository a version would come from, what else it would pull in. A
+        # recorded run asked --print-uris where percona-server-server lived, was
+        # refused, and spent the next step downloading 134MB of .deb to find out.
+        lookahead = {"-s", "--simulate", "--dry-run", "--just-print", "--no-act", "--recon",
+                     "--print-uris"}
+        if not _any_flag(args, {"-y", "--yes", "--assume-yes", "-q", "-qq"} | lookahead):
             return Verdict(BLOCK, "apt install without -y will stall on a prompt")
 
     if program in {"mysql", "mariadb"} and not _any_flag(args, {"-e", "--execute", "-f", "--version", "-V"}):

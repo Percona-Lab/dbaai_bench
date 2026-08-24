@@ -292,7 +292,10 @@ Every command, every script and every file write is classified before execution
   approach. Two kinds: things that destroy the machine (`mkfs`, `dd of=/dev/sda`,
   `rm -rf /`, stopping sshd) and things that would hang forever on a closed
   stdin — `vim`, `less`, bare `mysql`/`mariadb`/`psql`/`mongosh`/`valkey-cli`,
-  `apt install` without `-y`, `mysql_secure_installation`, `crontab -e`, a
+  `apt install` without `-y` (but not `-s` or `--print-uris`, which print the plan
+  or the `.deb` URLs and return before apt reaches a prompt — a recorded run was
+  refused `--print-uris` and spent the next step downloading 134MB of package to
+  learn the same thing), `mysql_secure_installation`, `crontab -e`, a
   database server started by hand instead of through systemd (`mysqld`,
   `mongod` without `--fork`, `valkey-server` without `--daemonize`), and cache
   commands that stream until interrupted (`MONITOR`, `SUBSCRIBE`, `--stat`). A

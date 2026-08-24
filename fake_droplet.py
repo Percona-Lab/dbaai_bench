@@ -67,6 +67,13 @@ VENDOR_ONLY = {name for name in PACKAGE_SERVICES if name.startswith("mongodb-")}
 # mysql-server and mariadb-server are two implementations of one service on one
 # port, and apt will not have both.
 SQL_SERVICES = {"mysql", "mariadb"}
+# Flags that make an install not an install: apt prints the plan, or the .deb URLs
+# it would fetch, and leaves the machine alone. The guard allows these because they
+# are how a step looks ahead, so the simulator has to know them too - installing
+# for real on `apt-get install -s` would let a run pass its verdicts without ever
+# having installed anything.
+APT_LOOKAHEAD = {"-s", "--simulate", "--dry-run", "--just-print", "--no-act", "--recon",
+                 "--print-uris"}
 # Unit names that resolve to a different unit. MariaDB ships mysql.service and
 # mysqld.service as aliases of mariadb.service, and models write all three.
 UNIT_ALIASES = {
@@ -1216,6 +1223,13 @@ class FakeDroplet:
         if unknown:
             return 100, "", f"E: Unable to locate package {unknown[0]}\n"
 
+        # A name that does not resolve fails above either way - apt reports that
+        # before it decides whether it is fetching anything - but past this point
+        # nothing is installed, so a lookahead answers and stops here.
+        if {token for token in tokens if token.startswith("-")} & APT_LOOKAHEAD:
+            pending = [p for p in installed if p not in self.packages]
+            return 0, self._apt_lookahead(pending, command), ""
+
         lines = []
         for package in installed:
             if package in self.packages:
@@ -1248,6 +1262,28 @@ class FakeDroplet:
             else:
                 lines.append(f"Setting up {package} ...")
         return 0, "Reading package lists...\n" + "\n".join(lines) + "\n", ""
+
+    def _apt_lookahead(self, packages: list[str], command: str) -> str:
+        """What apt says when it was told to look rather than install.
+
+        --print-uris lists the archives it would fetch, one line each; -s and its
+        aliases list what it would unpack. Versions are made up because this
+        simulator has no version table, and they say so - a model that reads one
+        back and downloads it gets the same answer from the curl route.
+        """
+        version = "1.0-simulated"
+        if "--print-uris" in command:
+            lines = [f"'http://archive.ubuntu.com/ubuntu/pool/main/{package[0]}/{package}/"
+                     f"{package}_{version}_amd64.deb' {package}_{version}_amd64.deb 4096 "
+                     f"SHA256:{'0' * 64}" for package in packages]
+        else:
+            lines = [f"{verb} {package} ({version} Ubuntu:24.04/noble [amd64])"
+                     for package in packages for verb in ("Inst", "Conf")]
+        # The plan first and the detail after it, which is the order apt prints them
+        # in: the statistics come out of DoInstall, before either branch above runs.
+        return ("Reading package lists...\nBuilding dependency tree...\n"
+                + f"0 upgraded, {len(packages)} newly installed, 0 to remove and 0 not upgraded.\n"
+                + "".join(f"{line}\n" for line in lines))
 
     def _apt_remove(self, match, command):
         for package in self._tokens(command):
