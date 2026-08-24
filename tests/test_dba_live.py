@@ -1,10 +1,15 @@
-"""A real DigitalOcean-hosted model driving the harness against the fake droplet.
+"""A real model driving the harness against the fake droplet.
 
 Nothing here touches a real server, but everything else is real: the model, the
 protocol, the guard, the secret substitution, the report.
 
     uv run python test_dba_live.py [model] [--task "..."] [--steps N]
     uv run python test_dba_live.py [model] --pair      (two servers, replication)
+    uv run python test_dba_live.py qwen3.8-27b --provider local     (free)
+
+Any of the gateways in do_dba/inference/providers.py will do. --provider local is
+the self-hosted one, which costs nothing, so it is the cheap way to see how a
+model behaves on a task before paying a hosted one to do the same thing.
 
 --pair is the multi-server case: two droplets on one private network, passed the
 way an operator passes them - a bare list, with no roles assigned. The model has
@@ -17,6 +22,7 @@ which of the two it picked, only that it picked one and stayed with it.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -27,9 +33,11 @@ sys.path.insert(0, str(PROJECT))
 
 from do_dba.agent import DBAAgent, Limits
 from do_dba.fleet import Fleet, parse_target
+from do_dba.inference import details, providers
+from do_dba.inference.catalog import Catalog
 from do_dba.inference.client import InferenceClient
-from do_dba.inference.config import base_url, find_api_key, load_dotenv
-from do_dba.inference.pricing import PriceBook, format_cost
+from do_dba.inference.config import load_dotenv
+from do_dba.inference.pricing import Price, PriceBook, format_cost, from_records
 from do_dba.report import HostInfo, RunRecord
 from do_dba.secrets import SecretStore
 from fake_droplet import FakeDroplet, Network
@@ -71,7 +79,12 @@ def pair_fleet() -> Fleet:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", nargs="?", default="llama-4-maverick")
+    parser.add_argument("model", nargs="?", default="",
+                        help="model id or a fragment of one; the provider's default if omitted")
+    parser.add_argument("--provider",
+                        default=os.environ.get("DBA_PROVIDER", "").strip() or providers.DIGITALOCEAN,
+                        help="which gateway serves the model (default: digitalocean, "
+                             "or $DBA_PROVIDER)")
     parser.add_argument("--task", default="")
     parser.add_argument("--pair", action="store_true",
                         help="two servers on a private network, replicating")
@@ -82,22 +95,60 @@ def main() -> int:
     steps = args.steps or (30 if args.pair else 18)
 
     load_dotenv()
-    client = InferenceClient(api_key=find_api_key(), base_url=base_url(), label="DigitalOcean")
+    provider = providers.get(args.provider)
+    client = InferenceClient(
+        api_key=provider.api_key(),
+        base_url=provider.base(),
+        headers=provider.headers,
+        label=provider.label,
+        usage_accounting=provider.usage_accounting,
+        key_help=provider.key_help,
+        read_timeout=provider.read_timeout(),
+    )
+    # Asked for rather than assumed: a fragment is easier to type than a full id,
+    # a self-hosted server pins no default, and a run that spends money on the
+    # wrong model is worse than one that stops here.
+    records = details.described(client.list_models(), provider.detail_url(), provider.api_key())
+    catalog = Catalog(records)
+    match, candidates = catalog.resolve(args.model) if args.model else (None, [])
+    if args.model and match is None:
+        listed = ", ".join(m.id for m in (candidates or catalog.chat)[:20])
+        raise SystemExit(f"{args.model!r} does not name one model on {provider.label}: {listed}")
+    model = match.id if match else provider.choose_default(catalog)
+    if not model:
+        raise SystemExit(f"{provider.label} pins no default - name a model: "
+                         + ", ".join(m.id for m in catalog.chat[:20]))
+    prices = PriceBook()
+    prices.learn(from_records(records))
+    if not provider.metered:
+        # As cli.py does it: a server the operator owns bills nothing per token,
+        # so its replies are priced at zero rather than left as "cost n/a".
+        prices.learn({info.id: Price(0.0, 0.0) for info in catalog.all})
+
     fleet = pair_fleet() if args.pair else one_fleet()
     fleet.survey()
     droplet = fleet.only.runner if not args.pair else fleet.targets[0].runner
     store = SecretStore()
 
-    directory = RUNS / args.model.replace(":", "-").replace("/", "-")
+    # As cli.py does it: what the model is shown, and what it may reply, sized to
+    # the window the gateway reported for it.
+    info = catalog.get(model)
+    limits = Limits.for_window(info.context_window if info else 0, max_steps=steps,
+                               command_timeout=300.0, max_cost=args.max_cost)
+
+    directory = RUNS / model.replace(":", "-").replace("/", "-")
     shutil.rmtree(directory, ignore_errors=True)
     record = RunRecord(
         directory=directory,
         task=task,
         hosts=[HostInfo(name=name, label=label, facts=facts)
                for name, label, facts in fleet.host_lines()],
-        model=args.model,
+        model=model,
         mode="auto",
         dry_run=False,
+        provider=provider.label,
+        metered=provider.metered,
+        context=", ".join(limits.context_parts()),
         redact=store.redact,
     )
 
@@ -115,19 +166,22 @@ def main() -> int:
 
     agent = DBAAgent(
         client=client,
-        model=args.model,
+        model=model,
         fleet=fleet,
         task=task,
         record=record,
         store=store,
-        prices=PriceBook(),
+        prices=prices,
         emit=emit,
         approve=approve,
         mode="auto",
-        limits=Limits(max_steps=steps, command_timeout=300.0, max_cost=args.max_cost),
+        limits=limits,
     )
 
-    print(f"model: {args.model}\ntask:  {task}\nservers: {fleet.label}\n")
+    window = f", {info.context_label}" if info and info.context_label else ""
+    cold = " (not loaded - the first step waits for the weights)" if info and info.loaded is False else ""
+    print(f"model: {model}  (via {provider.label}{window}){cold}\ntask:  {task}\n"
+          f"servers: {fleet.label}\n")
     outcome = agent.run()
     store.save(directory / "secrets.json")
     report = record.write_report()

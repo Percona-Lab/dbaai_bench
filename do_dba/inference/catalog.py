@@ -38,6 +38,22 @@ _NON_CHAT_HINTS = (
 # anywhere in an id.
 _NON_CHAT_PREFIXES = ("bge-", "e5-", "gte-")
 
+# What a server that names the kind of model outright calls them. LM Studio's
+# /api/v0/models does (see inference/details.py) and it beats every guess made
+# from an id below: "vlm" is a chat model that can also see, and an embedding
+# model named after its architecture rather than its job - nomic-embed is caught
+# by the hints, muse-glimmer would not be - is only knowable this way.
+_CHAT_TYPES = {"llm", "vlm"}
+_NON_CHAT_TYPES = {"embeddings", "embedding", "image", "audio", "tts", "rerank", "reranker"}
+# LM Studio's words for whether the weights are in memory.
+_LOAD_STATES = {"loaded", "not-loaded", "loading"}
+
+# owned_by values that name the host rather than whoever made the model, so
+# grouping by them would put every model in one meaningless heading. LM Studio
+# reports "organization_owner" for everything it serves; DigitalOcean reports
+# itself. An empty string lands here too, which is where it belongs.
+_ANONYMOUS_OWNERS = {"", "digitalocean", "organization_owner", "system", "local", "lm-studio"}
+
 # Ordered longest-prefix-first so "ministral" is not swallowed by "mistral".
 _PROVIDERS: tuple[tuple[str, str], ...] = (
     # router:* are DigitalOcean aliases that pick a model for you per request.
@@ -71,6 +87,12 @@ class ModelInfo:
     provider: str
     is_chat: bool
     context_window: int | None = None
+    # Whether the weights are in memory right now, where the gateway says so -
+    # None everywhere else, which is not the same as False. A hosted gateway keeps
+    # its own models warm and never mentions it; a self-hosted one has one model
+    # loaded at a time, and asking for a cold one means waiting for it to be read
+    # off disk before the first token.
+    loaded: bool | None = None
 
     @property
     def context_label(self) -> str:
@@ -157,22 +179,41 @@ def _to_info(record: dict[str, Any]) -> ModelInfo:
         # vendor slug is the only grouping available - and it is a good one.
         provider = model_id.split("/", 1)[0].replace("-", " ").title()
     if not provider:
-        provider = owned_by.title() if owned_by and owned_by.lower() != "digitalocean" else "Other"
+        provider = owned_by.title() if owned_by.lower() not in _ANONYMOUS_OWNERS else "Other"
 
-    # Field names vary by gateway; take the first plausible one.
+    # Field names vary by gateway; take the first plausible one. The length the
+    # weights were actually loaded with comes first where it is reported, because
+    # it is the limit a request will hit: LM Studio will load a 256K model with a
+    # 32K window if that is what it was told to do, and the maximum below it then
+    # describes the file rather than the server.
     context_window = None
-    for key in ("context_window", "context_length", "max_context_length", "max_input_tokens"):
+    for key in ("loaded_context_length", "context_window", "context_length",
+                "max_context_length", "max_input_tokens"):
         value = record.get(key)
         if isinstance(value, int) and value > 0:
             context_window = value
             break
 
+    # "loaded", "not-loaded", "loading" are LM Studio's three words for it. Any
+    # other value is an answer to some different question, so it leaves this one
+    # unanswered rather than reading as a no.
+    state = str(record.get("state") or "").strip().lower()
+    loaded = state == "loaded" if state in _LOAD_STATES else None
+
     is_chat = _is_chat(record, lowered)
-    return ModelInfo(id=model_id, provider=provider, is_chat=is_chat, context_window=context_window)
+    return ModelInfo(id=model_id, provider=provider, is_chat=is_chat,
+                     context_window=context_window, loaded=loaded)
 
 
 def _is_chat(record: dict[str, Any], lowered: str) -> bool:
     """Whether /v1/chat/completions will accept this model."""
+    # A server that says what kind of model it is has settled the question.
+    kind = str(record.get("type") or "").strip().lower()
+    if kind in _CHAT_TYPES:
+        return True
+    if kind in _NON_CHAT_TYPES:
+        return False
+
     # OpenRouter states its modalities outright, which beats inferring anything
     # from the id: a model that can emit text is usable here, whatever it is
     # named. A model that only emits images or audio is not.

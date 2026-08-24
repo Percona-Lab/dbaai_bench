@@ -77,11 +77,17 @@ def base_url() -> str:
     return os.environ.get("DO_INFERENCE_BASE_URL", "").strip() or DEFAULT_BASE_URL
 
 
-def stall_timeout() -> float:
-    """Seconds to wait for the next byte before giving up on a stream."""
+def stall_timeout(default: float = DEFAULT_STALL_TIMEOUT) -> float:
+    """Seconds to wait for the next byte before giving up on a stream.
+
+    DO_INFERENCE_TIMEOUT wins wherever it is set. The default is the caller's,
+    because how long a first token can reasonably take is a property of where the
+    model is: a hosted gateway has the weights loaded already, and a server on
+    your own network may be reading 60GB off a disk before it answers at all.
+    """
     raw = os.environ.get("DO_INFERENCE_TIMEOUT", "").strip()
     try:
         value = float(raw)
-        return value if value > 0 else DEFAULT_STALL_TIMEOUT
+        return value if value > 0 else default
     except ValueError:
-        return DEFAULT_STALL_TIMEOUT
+        return default

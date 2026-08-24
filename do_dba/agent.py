@@ -279,6 +279,73 @@ class Outcome:
         return self.status == "done"
 
 
+# ------------------------------------------------------------- context budget
+# Everything below turns one number - what the gateway says the model's context
+# window is - into the three limits that spend it. Where that number is unknown the
+# fixed defaults in Limits stand, which is how every run worked before the harness
+# could ask for it (inference/details.py gets it out of a self-hosted server; a
+# hosted gateway publishes it in /v1/models).
+
+# Command output tokenizes worse than prose. Measured by sending blocks of real
+# output out of output/*/report.md to a real tokenizer: 2.38 to 3.56 chars per
+# token, mean 2.73. The low end is the one to assume, because an estimate that
+# reads the prompt as smaller than it is would trim too late - and trimming too
+# late is the failure this arithmetic exists to prevent.
+CHARS_PER_TOKEN = 2.5
+
+# The ceiling on a single reply, sent as max_tokens. Measured over the 531 replies
+# in output/: median 376 completion tokens, p95 3,238, and the largest that had
+# something to say 13,391. Three came back at exactly 65,536 - a gateway's own cap
+# being hit by a model that had started repeating itself - and cost 61% of their
+# run while executing nothing, because a reply cut off mid-command cannot be run
+# and is asked again. 16K clears the largest real reply with room to spare.
+MAX_REPLY_TOKENS = 16384
+# ... but never more than this share of the window, so that on a small model the
+# reply cannot claim the space the conversation needs.
+REPLY_SHARE = 8
+# Held back for the system prompt and for the arithmetic being an estimate rather
+# than a count. The system prompt measures 1,700-2,900 tokens across recorded runs,
+# more with several servers and a list of credentials.
+RESERVED_TOKENS = 4096
+# What is left is shared between the results of past steps and the model's own
+# turns. Half each: a reasoning model's scratchpad comes back inside the reply and
+# stays in the messages, so its turns are the term that actually grows without
+# bound - the observations are what this trims, so they get the half that can be
+# planned for.
+HISTORY_SHARE = 0.5
+# One result may hold this share of the window, within these bounds. 3,000 chars is
+# what every run used before this existed, and on a large window it is needlessly
+# blind - a SHOW REPLICA STATUS cut in half is a step the model has to spend
+# another one on. Below about 60K the share is the tighter number and results get
+# shorter than they used to be, which is the right way round: on a small model an
+# 8,000-char result would crowd out the conversation it belongs to.
+OUTPUT_SHARE = 0.02
+MIN_OUTPUT_CHARS = 1200
+MAX_OUTPUT_CHARS = 8000
+# A window smaller than this cannot hold the system prompt, a step and a result
+# with anything left to plan against, so nothing is derived from it: the fixed
+# limits stand and the gateway is left to refuse the run in its own words.
+MIN_WINDOW = 8192
+# The prompt is allowed this much of the usable window before old assistant turns
+# are trimmed as well. Past it, a run is heading for a refusal from the gateway,
+# which arrives as an error that ends the run rather than as a step that recovers.
+PRESSURE_SHARE = 0.85
+# What is left of a message once it has been trimmed: enough to say which step it
+# was and how it ended, and the full text is in the transcript either way.
+STUB_CHARS = 400
+TRIMMED_MARK = "\n... [earlier output trimmed]"
+
+
+def estimate_tokens(text: str) -> int:
+    """Roughly how many tokens a string will cost, erring high. See CHARS_PER_TOKEN."""
+    return int(len(text) / CHARS_PER_TOKEN) + 1
+
+
+def thousands(tokens: int) -> str:
+    """4096 -> 4K, 262144 -> 262K. The exact figure is not the point of these."""
+    return f"{tokens // 1000}K" if tokens >= 1000 else str(tokens)
+
+
 @dataclass
 class Limits:
     max_steps: int = 40
@@ -293,8 +360,59 @@ class Limits:
     max_protocol_retries: int = 2
     # How many times a "done" whose checks fail is handed back to be fixed.
     max_done_rejections: int = 2
-    # Older observations are trimmed to keep the prompt (and its cost) bounded.
+    # Older observations are trimmed to keep the prompt (and its cost) bounded. Used
+    # when the window is unknown; with one, history_tokens below is the rule and this
+    # is only the floor of what stays whole.
     keep_full_observations: int = 6
+    # What the gateway said this model's context window is, and what was derived
+    # from it. All three are zero when it said nothing, and then nothing here is
+    # measured against a window: replies are capped by the gateway rather than by
+    # the harness, and observations are trimmed by count as they always were.
+    context_window: int = 0
+    max_reply_tokens: int = 0
+    history_tokens: int = 0
+
+    @classmethod
+    def for_window(cls, window: int, **overrides) -> "Limits":
+        """Limits sized to the model's context window, or the fixed ones without it.
+
+        An explicit value always wins: `for_window(262144, max_output_chars=3000)`
+        is how a caller says it means 3,000 whatever the window allows.
+        """
+        window = max(0, int(window or 0))
+        if window < MIN_WINDOW:
+            return cls(**overrides)
+        reply = max(1024, min(MAX_REPLY_TOKENS, window // REPLY_SHARE))
+        history = int(max(0, window - reply - RESERVED_TOKENS) * HISTORY_SHARE)
+        output = int(min(MAX_OUTPUT_CHARS,
+                         max(MIN_OUTPUT_CHARS, window * OUTPUT_SHARE * CHARS_PER_TOKEN)))
+        derived = {
+            "context_window": window,
+            "max_reply_tokens": reply,
+            "history_tokens": history,
+            "max_output_chars": output,
+        }
+        derived.update(overrides)
+        return cls(**derived)
+
+    def context_parts(self) -> list[str]:
+        """What the window was spent on, for the run panel and the report. [] without one."""
+        if not self.context_window:
+            return []
+        return [
+            f"{thousands(self.context_window)} window",
+            f"{self.max_output_chars:,} chars per result",
+            f"{thousands(self.history_tokens)} of results kept whole",
+            f"replies capped at {thousands(self.max_reply_tokens)}",
+        ]
+
+    @property
+    def pressure_tokens(self) -> int:
+        """The prompt size past which old assistant turns are trimmed too. 0 = never."""
+        if not self.context_window:
+            return 0
+        usable = self.context_window - self.max_reply_tokens
+        return int(usable * PRESSURE_SHARE)
 
 
 class DBAAgent:
@@ -348,6 +466,8 @@ class DBAAgent:
         self.cost_complete = True
         self.last_finish = ""  # why the last reply ended; "length" means cut off
         self._observation_indices: list[int] = []
+        # Said once per run, however many steps are trimmed under pressure.
+        self._pressure_noted = False
 
     # ---------------------------------------------------------------- prompts
 
@@ -373,7 +493,7 @@ RULES
    work genuinely needs more than one command - a loop, a retry, a check whose answer
    decides the next command - make it an ACTION: script instead of chaining commands
    with && across three lines. It is copied to the server and run there, and its exit
-   code, stdout and stderr come back exactly as a command's do.
+   code, stdout and stderr come back exactly as a command's do.{self._reply_rule()}
 2. Nothing interactive: stdin is /dev/null. Use -y with apt-get, --no-pager with
    systemctl, mysql -e '...', psql -c '...', mongosh --eval '...' and valkey-cli
    with the command on the same line. Editors, pagers, bare REPLs, a server started
@@ -444,6 +564,19 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
             "and do not invent a second name for one.",
         ]
         return "\n".join(lines) + "\n\n"
+
+    def _reply_rule(self) -> str:
+        """The reply-length rule, where the harness knows what the cap is.
+
+        Worth saying rather than leaving to be discovered: a reply that runs into
+        the cap stops mid-command, cannot be run, and is asked again from scratch -
+        so the only thing the model gets for a long one is the same step twice.
+        """
+        if not self.limits.max_reply_tokens:
+            return ""
+        return (f" Keep the reply itself under\n"
+                f"   {self.limits.max_reply_tokens:,} tokens: past that it is cut off mid-command, "
+                "nothing runs, and you are\n   asked for the step again.")
 
     def _reuse_rule(self) -> str:
         """The half of rule 4 that only applies when a credential already exists."""
@@ -786,6 +919,11 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
                 messages=messages,
                 temperature=self.temperature,
                 effort=self.effort,
+                # Where the window is known, a reply that has stopped being a step
+                # and started repeating itself is cut off by the harness instead of
+                # by the gateway, at a fraction of the tokens. None asks for the
+                # gateway's own cap, which is what happens when it said nothing.
+                max_tokens=self.limits.max_reply_tokens or None,
                 on_note=lambda note: self.emit("note", note),
             )
         except InferenceError as exc:
@@ -935,13 +1073,83 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
         self._compact()
 
     def _compact(self) -> None:
-        """Trim old observations so the prompt does not grow without bound."""
-        stale = self._observation_indices[: -self.limits.keep_full_observations]
+        """Trim old observations so the prompt does not grow without bound.
+
+        With a window to measure against, the rule is a token budget rather than a
+        count: results stay whole, newest first, until they fill history_tokens, and
+        older ones are cut to a stub. On a 262K model that budget is larger than a
+        40-step run can fill, so nothing is trimmed at all - which is the point of
+        asking the gateway how large the window is. Without one it is the old count,
+        and the last keep_full_observations stay whole however large the window
+        actually was.
+        """
+        budget = self.limits.history_tokens
+        stale: list[int] = []
+        if budget:
+            spent = 0
+            whole = True
+            for rank, position in enumerate(reversed(self._observation_indices)):
+                cost = estimate_tokens(self.messages[position]["content"])
+                # The newest result is never trimmed, whatever it costs: it is what
+                # the next step is an answer to.
+                if whole and (rank == 0 or spent + cost <= budget):
+                    spent += cost
+                    continue
+                whole = False
+                stale.append(position)
+        else:
+            stale = list(self._observation_indices[: -self.limits.keep_full_observations])
         for position in stale:
-            message = self.messages[position]
-            body = message["content"]
-            if len(body) > 400 and not body.endswith("[earlier output trimmed]"):
-                message["content"] = body[:400] + "\n... [earlier output trimmed]"
+            self._stub(position)
+        self._relieve()
+
+    def _stub(self, position: int) -> bool:
+        """Cut one message down to its opening lines. False if there was nothing to cut."""
+        message = self.messages[position]
+        body = message["content"]
+        if len(body) <= STUB_CHARS or body.endswith(TRIMMED_MARK):
+            return False
+        message["content"] = body[:STUB_CHARS] + TRIMMED_MARK
+        return True
+
+    def _relieve(self) -> None:
+        """Trim the model's own old turns when the prompt is closing on the window.
+
+        Observations are trimmed by budget above; assistant turns never were, and
+        they are the term that actually grows without bound - a reasoning model's
+        scratchpad comes back inside the reply and stays in the messages, and one
+        recorded reply was 10,660 tokens of it. Past PRESSURE_SHARE of the usable
+        window this cuts them oldest-first, keeping the last two whole, until the
+        prompt fits. It is the difference between a long run carrying on with less
+        of its own history and one the gateway refuses, which ends it outright.
+        """
+        ceiling = self.limits.pressure_tokens
+        if not ceiling:
+            return
+        total = sum(estimate_tokens(message["content"]) for message in self.messages)
+        if total <= ceiling:
+            return
+        spared = [position for position, message in enumerate(self.messages)
+                  if message["role"] == "assistant"][-2:]
+        trimmed = 0
+        for position, message in enumerate(self.messages):
+            if total <= ceiling:
+                break
+            if message["role"] != "assistant" or position in spared:
+                continue
+            before = estimate_tokens(message["content"])
+            if self._stub(position):
+                total -= before - estimate_tokens(message["content"])
+                trimmed += 1
+        if not trimmed:
+            return
+        self.record.event("context_pressure", trimmed=trimmed, prompt_tokens=total,
+                          window=self.limits.context_window, ceiling=ceiling)
+        if not self._pressure_noted:
+            self._pressure_noted = True
+            self.emit("note", f"the conversation reached {ceiling:,} of the model's "
+                              f"{self.limits.context_window:,}-token window, so its own earlier "
+                              "replies are being shortened to make room")
 
     def _verify(self, model_checks: list[Check]) -> list[str]:
         """Re-check the work with the harness's own commands, not the model's word.

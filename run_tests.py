@@ -43,6 +43,7 @@ SUITES = [
     ("wrap", "test_dba_wrap.py", False),
     ("providers", "test_dba_providers.py", False),
     ("openrouter-wire", "test_dba_openrouter_wire.py", False),
+    ("selfhosted-wire", "test_dba_selfhosted_wire.py", False),
     # This one talks to mock_do_server.py on 127.0.0.1:8899, which the runner
     # starts for it; on its own it fails with a connection error.
     ("client", "test_dba_client.py", True),

@@ -7,6 +7,7 @@ blame in an error message, and whether the gateway will say what a reply cost.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
@@ -101,6 +102,17 @@ _DROPPABLE_PARAMS = ("temperature", "top_p", "stream_options")
 # than at the top level, so dropping one edits that dict and not the request.
 _DROPPABLE_EXTRAS = ("usage", "reasoning")
 
+# A self-hosted server can put the model away between two steps of a run: LM Studio
+# unloads on an idle timer, and the next request comes back 400 "Model unloaded."
+# That is a pause rather than a refusal - the weights are still on disk and the
+# request that follows loads them again - so it is worth asking once more instead of
+# ending a run halfway through installing a database, which is what a recorded run
+# did at step 4 while the model thought about step 3. Asking again costs one request
+# on a server that has just-in-time loading turned off, and the run then fails as it
+# would have anyway.
+_UNLOADED_MARKS = ("model unloaded", "no models loaded", "model not loaded")
+_RELOAD_WAIT = 2.0  # long enough for the unload to finish; the load itself is the server's wait
+
 
 class InferenceClient:
     def __init__(
@@ -111,11 +123,16 @@ class InferenceClient:
         headers: dict[str, str] | None = None,
         label: str = "The service",
         usage_accounting: bool = False,
+        key_help: str = "",
     ):
         self.base_url = base_url
         # Named in credential errors, because "DigitalOcean rejected the key" is
         # a confusing thing to read when the key was OpenRouter's.
         self.label = label
+        # What to do about a 401 on this gateway, printed with the rejection. It
+        # matters most where no key was sent at all: a self-hosted server that
+        # turns out to want one has to say which variable to put it in.
+        self.key_help = key_help
         # Ask for the charged amount per reply where the gateway reports it.
         self.usage_accounting = usage_accounting
         self.read_timeout = read_timeout if read_timeout is not None else stall_timeout()
@@ -223,10 +240,11 @@ class InferenceClient:
             raise self._stream_failure(exc) from exc
 
     def _rejected(self) -> str:
-        return (
+        rejection = (
             f"{self.label} rejected the credential (401). Check that the key is "
             "active and copied in full."
         )
+        return f"{rejection}\n\n{self.key_help}" if self.key_help else rejection
 
     def _stream_failure(self, exc: Exception) -> InferenceError:
         name = type(exc).__name__
@@ -287,20 +305,30 @@ class InferenceClient:
         return {"extra_body": extra} if extra else {}
 
     def _create(self, params: dict[str, Any], on_note: Callable[[str], None] | None):
-        """Send the request, retrying once per parameter the model rejects."""
+        """Send the request, retrying once per parameter the model rejects.
+
+        And once for a model the server unloaded between steps - see _UNLOADED_MARKS.
+        """
         attempt = dict(params)
         already_fixed: set[str] = set()
 
-        # One attempt per fix there could be, and one more to send the request
-        # that finally has none left: a model that refuses everything droppable
-        # still gets asked the question.
-        for _ in range(len(_DROPPABLE_PARAMS) + len(_DROPPABLE_EXTRAS) + 2):
+        # One attempt per fix there could be, one for a model the server had put
+        # away, and one more to send the request that finally has none left: a model
+        # that refuses everything droppable still gets asked the question.
+        for _ in range(len(_DROPPABLE_PARAMS) + len(_DROPPABLE_EXTRAS) + 3):
             try:
                 return self._client.chat.completions.create(**attempt)
             except AuthenticationError as exc:
                 raise InferenceError(self._rejected()) from exc
             except BadRequestError as exc:
-                fix = _diagnose_bad_request(str(exc), attempt, already_fixed)
+                message = str(exc)
+                if _unloaded(message) and "wait:unloaded" not in already_fixed:
+                    already_fixed.add("wait:unloaded")
+                    if on_note:
+                        on_note(_FIX_NOTES["wait:unloaded"])
+                    time.sleep(_RELOAD_WAIT)
+                    continue  # the same request, to a server that has to load it first
+                fix = _diagnose_bad_request(message, attempt, already_fixed)
                 if fix is None:
                     raise InferenceError(_readable(exc)) from exc
                 already_fixed.add(fix)
@@ -328,7 +356,14 @@ _FIX_NOTES = {
                   "the cost line will be worked out from published rates",
     "drop:reasoning": "this model cannot be asked to think harder - sent without an effort",
     "rename:max_tokens": "this model wants max_completion_tokens - renamed automatically",
+    "wait:unloaded": "the server had put the model away - asking again, which loads it",
 }
+
+
+def _unloaded(message: str) -> bool:
+    """Whether a 400 says the server no longer has the model in memory."""
+    lowered = message.lower()
+    return any(mark in lowered for mark in _UNLOADED_MARKS)
 
 
 def _diagnose_bad_request(message: str, params: dict[str, Any], already_fixed: set[str]) -> str | None:

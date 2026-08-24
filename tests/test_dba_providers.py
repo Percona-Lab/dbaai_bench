@@ -4,6 +4,11 @@ No network and no key: this pins the parts that decide where a run goes and what
 it is billed at - provider lookup, credential discovery, default-model choice,
 the chat/non-chat split, rates read from the gateway's own model list, and the
 hand-kept DigitalOcean table with its >200K price tiers.
+
+The self-hosted gateway is here too, from LM Studio-shaped records: no key, no
+prices, and a model list that is whatever was loaded onto the box that morning -
+plus the second endpoint that fills in what /v1/models has no field for, which
+context lengths and whether the weights are in memory come from.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ PROJECT = Path(__file__).resolve().parents[1]  # the suites sit in tests/, the h
 # Ahead of anything installed on purpose: the point is to test this tree.
 sys.path.insert(0, str(PROJECT))
 
-from do_dba.inference import providers
+from do_dba.inference import details, providers
 from do_dba.inference.catalog import Catalog
 from do_dba.inference.client import (
     COST_ACCOUNTING,
@@ -74,6 +79,20 @@ OPENROUTER_MODELS = [
         # A rate the gateway will not commit to: better left unpriced than guessed.
         "pricing": {"prompt": "-1", "completion": "-1"},
     },
+]
+
+
+# Shaped like a real GET /v1/models from the LM Studio server on the Mac Studio:
+# no prices, no context lengths, and owned_by naming the box rather than whoever
+# made the model. Ids come both ways, with a vendor prefix and without.
+SELFHOSTED_MODELS = [
+    {"id": "openai/gpt-oss-20b", "object": "model", "owned_by": "organization_owner"},
+    {"id": "qwen/qwen3.8-27b", "object": "model", "owned_by": "organization_owner"},
+    {"id": "glm-5.2", "object": "model", "owned_by": "organization_owner"},
+    {"id": "minimax-m3-mlx", "object": "model", "owned_by": "organization_owner"},
+    # An embedding model, which /v1/chat/completions will not serve.
+    {"id": "text-embedding-nomic-embed-text-v1.5", "object": "model",
+     "owned_by": "organization_owner"},
 ]
 
 
@@ -171,6 +190,171 @@ def main() -> int:
     images_only = Catalog([m for m in OPENROUTER_MODELS if m["id"].startswith("black-forest")])
     check(failures, openrouter.choose_default(images_only) == "",
           "with no usable model the harness must say so, not pick one")
+
+    # ------------------------------------------------- the self-hosted gateway
+    # A server somebody runs themselves is the same API with two things taken
+    # away: no credential to send, and no bill. Both are properties of the
+    # gateway, so both are checked here rather than in the client.
+    selfhosted = providers.get("selfhosted")
+    for typed in ("local", "self-hosted", "lmstudio", "vllm", "ollama", "self"):
+        check(failures, providers.get(typed).name == providers.SELFHOSTED,
+              f"'{typed}' should mean the self-hosted gateway")
+    check(failures, selfhosted.base_url == "https://mac-studio-lm.int.percona.com/v1",
+          f"wrong default endpoint: {selfhosted.base_url}")
+    check(failures, not selfhosted.metered and not selfhosted.usage_accounting,
+          "a server you own bills nothing per token and reports no costs")
+    check(failures, openrouter.metered and digitalocean.metered,
+          "a hosted gateway does bill per token")
+    check(failures, selfhosted.first_token_wait > providers.DEFAULT_STALL_TIMEOUT,
+          "a cold server loading weights needs longer than a hosted gateway")
+
+    lm_removed = clear_keys()
+    try:
+        # The key is the difference between this provider and the others: a
+        # missing one is the normal case, not a misconfiguration to report.
+        check(failures, selfhosted.api_key() == providers.PLACEHOLDER_KEY,
+              f"a self-hosted server should need no key, got {selfhosted.api_key()!r}")
+        os.environ["DBA_SELFHOSTED_KEY"] = "behind-a-proxy"
+        check(failures, selfhosted.api_key() == "behind-a-proxy",
+              "a key was ignored on a server that wants one")
+
+        # The address people quote is the host alone, because that is what the
+        # server's own interface shows. /v1 is where the API lives either way.
+        for given, want in (
+            ("https://mac-studio-lm.int.percona.com",
+             "https://mac-studio-lm.int.percona.com/v1"),
+            ("https://mac-studio-lm.int.percona.com/",
+             "https://mac-studio-lm.int.percona.com/v1"),
+            ("http://127.0.0.1:1234", "http://127.0.0.1:1234/v1"),
+            ("http://127.0.0.1:1234/v1", "http://127.0.0.1:1234/v1"),
+            ("http://127.0.0.1:1234/v1/", "http://127.0.0.1:1234/v1"),
+            # Already mounted somewhere: left alone, because a proxy can put it
+            # anywhere and guessing would break the one setup that was explicit.
+            ("https://gateway.example/openai/v1", "https://gateway.example/openai/v1"),
+        ):
+            os.environ["DBA_SELFHOSTED_BASE_URL"] = given
+            got = selfhosted.base()
+            check(failures, got == want, f"{given} became {got}, want {want}")
+        del os.environ["DBA_SELFHOSTED_BASE_URL"]
+        check(failures, selfhosted.base() == selfhosted.base_url,
+              "the default endpoint did not come back")
+    finally:
+        os.environ.pop("DBA_SELFHOSTED_KEY", None)
+        os.environ.pop("DBA_SELFHOSTED_BASE_URL", None)
+        os.environ.update(lm_removed)
+
+    loaded = Catalog(SELFHOSTED_MODELS)
+    check(failures, [m.id for m in loaded.other] == ["text-embedding-nomic-embed-text-v1.5"],
+          f"the embedding model should not be offered as chat: {[m.id for m in loaded.other]}")
+    # Nothing is pinned, because what this gateway serves is whatever was loaded
+    # onto it. With several models the operator says which; a 20B and a 27B on one
+    # box are not interchangeable, and picking the first listed would decide the
+    # run silently.
+    check(failures, selfhosted.choose_default(loaded) == "",
+          f"a loaded box should not be guessed at: {selfhosted.choose_default(loaded)}")
+    single = Catalog([SELFHOSTED_MODELS[1], SELFHOSTED_MODELS[4]])
+    check(failures, selfhosted.choose_default(single) == "qwen/qwen3.8-27b",
+          "one chat model needs no choosing")
+    embeddings_only = Catalog([SELFHOSTED_MODELS[4]])
+    check(failures, selfhosted.choose_default(embeddings_only) == "",
+          "a server with nothing chat-capable must say so, not pick the embedder")
+    # The rule is gated on there being no pinned default: a hosted gateway whose
+    # default was retired must still refuse rather than run on whatever is left.
+    check(failures, openrouter.choose_default(single) == "" and digitalocean.choose_default(single) == "",
+          "a pinned provider inherited the take-the-only-model rule")
+
+    # owned_by names the box, not the model's author, so it must not become a
+    # heading: an id with no known vendor in it falls back to "Other".
+    anonymous = Catalog([{"id": "some-local-finetune", "owned_by": "organization_owner"}])
+    check(failures, anonymous.all[0].provider == "Other",
+          f"the server's own owned_by leaked into the listing: {anonymous.all[0].provider}")
+    check(failures, loaded.get("glm-5.2").provider == "Z.ai",
+          "a flat id should still group under its vendor")
+    check(failures, loaded.get("qwen/qwen3.8-27b").provider == "Alibaba / Qwen",
+          "a vendor-prefixed id should group under its vendor")
+    check(failures, loaded.resolve("qwen3.8")[0].id == "qwen/qwen3.8-27b",
+          "-m should take a fragment of a self-hosted id")
+
+    # ------------------------------------ what /v1/models could not have said
+    # LM Studio answers the questions the OpenAI listing has no field for on a
+    # REST endpoint beside it, so the address is derived from the API root with
+    # the /v1 taken off - and any path a proxy mounted the server under kept.
+    lm_removed = clear_keys()
+    try:
+        for given, want in (
+            ("https://mac-studio-lm.int.percona.com",
+             "https://mac-studio-lm.int.percona.com/api/v0/models"),
+            ("https://mac-studio-lm.int.percona.com/v1",
+             "https://mac-studio-lm.int.percona.com/api/v0/models"),
+            ("http://127.0.0.1:1234/", "http://127.0.0.1:1234/api/v0/models"),
+            ("https://gateway.example/openai/v1", "https://gateway.example/openai/api/v0/models"),
+        ):
+            os.environ["DBA_SELFHOSTED_BASE_URL"] = given
+            got = selfhosted.detail_url()
+            check(failures, got == want, f"{given} asks about models at {got}, want {want}")
+    finally:
+        os.environ.pop("DBA_SELFHOSTED_BASE_URL", None)
+        os.environ.update(lm_removed)
+    # A gateway with no such endpoint is not asked, and details.described then
+    # hands the records straight back rather than reaching for a URL of its own.
+    for hosted in (openrouter, digitalocean):
+        check(failures, hosted.detail_url() == "",
+              f"{hosted.label} has no detail endpoint but named one: {hosted.detail_url()}")
+    check(failures, details.described(SELFHOSTED_MODELS, "") == SELFHOSTED_MODELS,
+          "a provider that cannot say more should leave the listing alone")
+    check(failures, details.fetch("") == [], "an empty URL should not be fetched")
+
+    # The merge, which is an addition and never a correction: /v1/models is the
+    # listing the chat endpoint agrees with, so a detail record may fill fields it
+    # left out and nothing else. Ids match case-insensitively; a model only the
+    # detail endpoint knows about is dropped, because it cannot be asked for.
+    merged = details.merge(
+        [{"id": "qwen/qwen3.8-27b", "owned_by": "organization_owner", "type": "llm"},
+         {"id": "glm-5.2", "owned_by": "organization_owner"}],
+        [{"id": "QWEN/QWEN3.8-27B", "type": "embeddings", "state": "loaded",
+          "max_context_length": 262144, "loaded_context_length": 32768, "publisher": "qwen"},
+         {"id": "qwen/qwen3.8-27b-q4", "type": "llm", "max_context_length": 262144}],
+    )
+    check(failures, [record["id"] for record in merged] == ["qwen/qwen3.8-27b", "glm-5.2"],
+          f"the merge changed which models exist: {[r['id'] for r in merged]}")
+    check(failures, merged[0]["type"] == "llm",
+          f"the detail endpoint overwrote what /v1/models said: {merged[0]['type']!r}")
+    check(failures, merged[0]["state"] == "loaded" and merged[0]["publisher"] == "qwen",
+          f"the absent fields were not filled: {merged[0]}")
+    check(failures, "state" not in merged[1],
+          "a model with no detail record was given another model's fields")
+    check(failures, details.merge(SELFHOSTED_MODELS, []) == SELFHOSTED_MODELS,
+          "an endpoint that answered nothing should cost the listing nothing")
+
+    # And what the catalog then makes of those fields. The window a request will
+    # actually hit is the one the weights were loaded with, not the larger one the
+    # file allows; `state` is the only way to know a step will wait for a 27B model
+    # to be read off disk; and `type` settles chat-or-not for a model whose name
+    # says neither - "muse-glimmer-30b" is an id no hint would catch either way.
+    enriched = Catalog(details.merge(SELFHOSTED_MODELS, [
+        {"id": "qwen/qwen3.8-27b", "type": "vlm", "state": "loaded",
+         "max_context_length": 262144, "loaded_context_length": 32768},
+        {"id": "openai/gpt-oss-20b", "type": "llm", "state": "not-loaded",
+         "max_context_length": 131072},
+        {"id": "glm-5.2", "type": "embeddings", "state": "loading", "max_context_length": 1048576},
+    ]))
+    warm = enriched.get("qwen/qwen3.8-27b")
+    cold = enriched.get("openai/gpt-oss-20b")
+    check(failures, warm.context_window == 32768 and warm.context_label == "32K ctx",
+          f"the loaded window lost to the maximum: {warm.context_window}")
+    check(failures, warm.loaded is True, f"a model in memory read as {warm.loaded!r}")
+    check(failures, cold.context_window == 131072 and cold.loaded is False,
+          f"a model on disk read as {cold.context_window}/{cold.loaded!r}")
+    check(failures, enriched.get("glm-5.2").loaded is False,
+          "a model still loading is not loaded yet")
+    check(failures, not enriched.get("glm-5.2").is_chat,
+          "a declared embedding model was offered as chat")
+    check(failures, enriched.get("minimax-m3-mlx").loaded is None,
+          "a model the server said nothing about was reported as cold")
+    # A hosted gateway keeps its own models warm and never mentions it, so there is
+    # nothing to print - and nothing to mistake for a model that is not there.
+    check(failures, all(model.loaded is None for model in catalog.all),
+          "a hosted gateway was reported as having models in and out of memory")
 
     # ---------------------------------------------------- chat/non-chat split
     ids = {model.id for model in catalog.chat}

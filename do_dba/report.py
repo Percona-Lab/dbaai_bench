@@ -63,6 +63,10 @@ class RunRecord:
     mode: str
     dry_run: bool
     provider: str = ""  # which gateway served the model
+    # What the model's context window was spent on, where the gateway reported one.
+    # Recorded because it decides what the model was shown: a run whose results were
+    # cut at 3,000 characters is not comparable with one cut at 8,000. See agent.py.
+    context: str = ""
     started: datetime = field(default_factory=datetime.now)
     steps: list[StepRecord] = field(default_factory=list)
     verifications: list[Verification] = field(default_factory=list)
@@ -77,6 +81,9 @@ class RunRecord:
     # silently - the report says which it is looking at.
     billed_replies: int = 0
     estimated_replies: int = 0
+    # Whether the gateway bills per token at all. A self-hosted server does not,
+    # so its zero is a fact about the run rather than a rate looked up in a table.
+    metered: bool = True
     status: str = "incomplete"
     summary: str = ""
     redact: Callable[[str], str] = lambda text: text
@@ -94,6 +101,7 @@ class RunRecord:
             provider=self.provider,
             mode=self.mode,
             dry_run=self.dry_run,
+            context=self.context,
             at=self.started.isoformat(timespec="seconds"),
         )
 
@@ -156,6 +164,8 @@ class RunRecord:
     @property
     def cost_note(self) -> str:
         """Where the cost figure came from, in parentheses, or nothing to add."""
+        if not self.metered:
+            return " (self-hosted - no per-token bill)"
         if self.billed_replies and self.estimated_replies:
             return " (part billed by the gateway, part from published rates)"
         if self.billed_replies:
@@ -179,6 +189,7 @@ class RunRecord:
             *self._host_lines(),
             f"- **Model:** {self.model}{f' (via {self.provider})' if self.provider else ''}",
             f"- **Mode:** {self.mode}{' (dry run - nothing was executed)' if self.dry_run else ''}",
+            *([f"- **Context:** {self.context}"] if self.context else []),
             f"- **Started:** {self.started.isoformat(timespec='seconds')}  ({elapsed:.0f}s elapsed)",
             f"- **Steps:** {len(self.steps)} proposed, {len(executed)} executed, {len(failed)} non-zero exit",
             f"- **Tokens:** {self.prompt_tokens:,} in / {self.completion_tokens:,} out",

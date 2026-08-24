@@ -54,21 +54,87 @@ done first. A key already exported in your environment beats the `.env` file.
 
 ## Where the model comes from
 
-Two gateways, both OpenAI-compatible, so the client, catalog and cost accounting
+Three gateways, all OpenAI-compatible, so the client, catalog and cost accounting
 are shared and only the base URL, the key and the spelling of model ids differ:
 
 | `--provider` | Default model | Key | Model ids |
 | --- | --- | --- | --- |
 | `openrouter` (default) | `anthropic/claude-sonnet-4.5` | `OPENROUTER_API_KEY` | `vendor/model` |
 | `digitalocean` | `anthropic-claude-opus-5` | `DIGITALOCEAN_INFERENCE_KEY` | flat, e.g. `anthropic-claude-opus-5` |
+| `selfhosted` | whatever is loaded (`-m`) | none | whatever the server calls them |
 
-`do`, `or`, `gradient` and any unambiguous prefix work as provider names. Keys
-come from the environment or the `.env` next to `dba.py`; set
-`DBA_PROVIDER=digitalocean` to change the default for good. Pick a model with
-`-m` (`-m claude-opus-4.5`, `-m gpt-oss-120b` — partial names work, and an
-ambiguous one prints its matches) or `DO_DBA_MODEL`, and see what your key can
-reach with `uv run dba.py --list-models`, which needs no `--host` since it never
-opens one.
+`do`, `or`, `gradient`, `local`, `lmstudio`, `vllm`, `ollama` and any unambiguous
+prefix work as provider names. Keys come from the environment or the `.env` next
+to `dba.py`; set `DBA_PROVIDER=digitalocean` to change the default for good. Pick
+a model with `-m` (`-m claude-opus-4.5`, `-m gpt-oss-120b` — partial names work,
+and an ambiguous one prints its matches) or `DO_DBA_MODEL`, and see what your key
+can reach with `uv run dba.py --list-models`, which needs no `--host` since it
+never opens one.
+
+### A server you run yourself
+
+`--provider local` points the same harness at any OpenAI-compatible server — LM
+Studio, vLLM, llama.cpp, Ollama — and defaults to the Mac Studio at
+`https://mac-studio-lm.int.percona.com`:
+
+```bash
+uv run dba.py --provider local --list-models
+uv run dba.py --provider local -m qwen3.8-27b --host 203.0.113.10 \
+  --task "install MySQL with an app database and its own login user"
+
+DBA_SELFHOSTED_BASE_URL=http://127.0.0.1:1234 uv run dba.py --provider local ...
+```
+
+Six things differ from a hosted gateway, all of them because the machine is
+yours:
+
+- **No key.** None is asked for and none of yours is sent. If your server does
+  sit behind auth, put the credential in `DBA_SELFHOSTED_KEY` — a 401 says so.
+- **No default model.** What the server serves is whatever was loaded onto it, so
+  nothing can be pinned here: with one chat model loaded it is used, and with
+  several `-m` says which (`DBA_SELFHOSTED_MODEL` to keep the choice). Embedding
+  models are filtered out of the listing as everywhere else.
+- **No bill.** The hardware was paid for before the run started, so replies are
+  priced at zero and the report says *self-hosted — no per-token bill* rather
+  than reporting an estimate or "cost n/a". Tokens are still counted, and
+  `--max-cost` simply has nothing to trip on.
+- **A longer first wait.** The first request usually loads the weights off disk,
+  which on a large model is minutes, so a self-hosted run waits 900s for the
+  first token instead of 180. `DO_INFERENCE_TIMEOUT` overrides it either way.
+- **The model can be put away mid-run.** A box in an office unloads on an idle
+  timer, and the next request comes back `400 Model unloaded.` — which ended a
+  recorded run at step 4, with MySQL and PostgreSQL installed and neither database
+  created. The weights are still on disk, so the same request is sent once more,
+  which is what makes the server load them again, and the operator is told why the
+  step took longer. A 400 that says anything else is still a refusal and is not
+  retried.
+- **A second listing.** `/v1/models` on such a server is three fields — id,
+  object, owned_by — with no context length and no way to tell an embedding model
+  from a chat one except by its name. LM Studio publishes the rest at
+  `/api/v0/models`, which the harness reads alongside the OpenAI one, so
+  `--list-models` and the run header can say `262K ctx` and mark which model is
+  in memory:
+
+  ```
+  qwen/qwen3.8-27b        262K ctx  no per-token bill  loaded
+  openai/gpt-oss-20b      131K ctx  no per-token bill
+  ```
+
+  A model named `loaded` is answering now; a cold one spends the first step being
+  read off disk. It is an enrichment and never a requirement: vLLM, llama.cpp and
+  Ollama have no such endpoint and answer 404, which costs the listing those two
+  columns and nothing else. `/v1/models` is never contradicted, and a model only
+  the detail endpoint knows about is not offered — the chat endpoint would refuse
+  it.
+
+`DBA_SELFHOSTED_BASE_URL` may be given as a bare host — `/v1` is filled in when
+the URL carries no path of its own, so a server mounted behind a proxy at
+`/openai/v1` is still taken exactly as written. The detail endpoint is derived from
+the same address with the `/v1` taken off, so a proxy that moves one moves both.
+
+A small local model is a real model on a real server: the guard, the plan gate
+and the standing checks all apply unchanged, which is the point of trying one on
+a task before spending on a hosted one.
 
 If the pinned default has been retired — which on OpenRouter happens week to week
 — the newest member of the first available preferred family is used instead, and
@@ -107,9 +173,10 @@ server
   package lock     free
 
 run
-  model    openai-gpt-oss-120b  ($0.05/M in · $0.40/M out)
+  model    openai-gpt-oss-120b  ($0.05/M in · $0.40/M out · 131K ctx)
   mode     auto
   limits   40 steps · 300s per command · cost cap none
+  context  131K window · 6,553 chars per result · 55K of results kept whole · replies capped at 16K
 
 working
   ↳ apt-get install -y mysql-server postgresql postgresql-contrib
@@ -482,7 +549,7 @@ a count when there is more than one:
 
 | File | Contents |
 | --- | --- |
-| `report.md` | Task, the servers, model, cost, each server as found, every step with the server it ran on, its command, exit code and output, and the independent verification |
+| `report.md` | Task, the servers, model, the context budget it was run with, cost, each server as found, every step with the server it ran on, its command, exit code and output, and the independent verification |
 | `transcript.jsonl` | One JSON line per event — steps, guard verdicts, approvals, verifications, and per reply its token counts, what it cost and where that figure came from — for after the fact |
 | `secrets.json` | The generated credentials, mode `0600` (only if any were used) |
 
@@ -500,7 +567,7 @@ line from it and the next run generates a new value for that name;
 | Group | Flags |
 | --- | --- |
 | servers | `--host [NAME=][USER@]HOST[:PORT]` (required except with `--list-models`, repeatable; unnamed servers are labelled `node1`, `node2`, … and the model assigns the roles — see [More than one server](#more-than-one-server)), `-u/--user` (root), `-p/--port` (22), `-i/--key`, `--ask-key-passphrase`, `--ask-password`, `--no-server-secrets`, `--accept-host-key` |
-| task | `--task ...`, `--task-file PATH`, `-m/--model`, `--provider {openrouter,digitalocean}` (openrouter), `--mode {plan,step,auto,unattended}`, `--dry-run`, `--yes`, `--probe` |
+| task | `--task ...`, `--task-file PATH`, `-m/--model`, `--provider {openrouter,digitalocean,selfhosted}` (openrouter), `--mode {plan,step,auto,unattended}`, `--dry-run`, `--yes`, `--probe` |
 | limits | `--max-steps` (40), `--timeout` (300s per command), `--max-cost USD`, `--temperature` (0.2), `--effort {low,medium,high}` (off) |
 | output | `--runs-dir` (`output/` in this project, or `$DBA_RUNS_DIR`), `--list-models`, `--no-color`, `--version` |
 
@@ -513,7 +580,9 @@ generation id, so a total can be taken apart and reconciled line by line with th
 activity page. A gateway that reports nothing (DigitalOcean today) falls back to
 tokens × the [pricing table](do_dba/inference/pricing.py), topped up with
 whatever rates the gateway publishes about itself, and the report says *estimated
-from published rates* — an estimate is never quietly added to a billed figure.
+from published rates* — an estimate is never quietly added to a billed figure. A
+self-hosted server sends no bill at all, so its replies are priced at zero and the
+report says so instead of guessing.
 Either way `--max-cost` stops the run when the spend reaches it. Command output
 is truncated to 3000 characters per step before it goes into the prompt, and
 older observations are trimmed, so a long run's prompt does not grow without
@@ -546,6 +615,42 @@ phase is also one silent request: the reply is not streamed, so raise
   limit (`finish_reason: length`), a command chopped in half still parses as a
   command — `curl … | python3 -c "` is a real example from a real run. The
   harness checks for it, runs nothing, and asks for a smaller step.
+- **The context window is a budget, and the harness spends it.** Where the gateway
+  says how large a model's window is — hosted ones publish it in `/v1/models`, and a
+  self-hosted LM Studio server on `/api/v0/models` — three limits are sized to it
+  instead of being the same for every model:
+
+  | window | chars per result | results kept whole | reply cap |
+  | --- | --- | --- | --- |
+  | 16K | 1,200 | 5K tokens | 2,048 |
+  | 131K | 6,553 | 55K tokens | 16,384 |
+  | 262K | 8,000 | 120K tokens | 16,384 |
+  | 1M | 8,000 | 514K tokens | 16,384 |
+  | not reported | 3,000 | the last 6 | the gateway's own |
+
+  Three things follow. Results are shown at up to 8,000 characters rather than
+  3,000, so a `SHOW REPLICA STATUS` arrives whole instead of costing another step to
+  read the rest of. Old results are trimmed against a token budget rather than a
+  count of six, which on any window above about 100K means a run never reaches it —
+  the model still sees every result in full at step 40, where before it saw six and
+  thirty-four 400-character stubs. And a reply is capped by the harness: measured
+  over the 531 replies in [output/](output/) the median is 376 completion tokens and
+  the largest with anything to say 13,391, but three ran to a gateway's own 65,536
+  ceiling, cost 61% of their run and executed nothing — a reply cut off mid-command
+  cannot be run, so it is thrown away and asked again. The model is told the cap in
+  its own rules.
+
+  Past 85% of the window the model's earlier replies are shortened too, oldest
+  first, keeping the last two. They are the term that actually grows without bound:
+  a reasoning model's scratchpad comes back inside the reply and stays in the
+  conversation, and one recorded reply was 10,660 tokens of it. Trimming them is
+  what a long run does instead of being refused by the gateway, which ends it.
+
+  The budget a run was given is on the record: a `Context:` line in `report.md` and
+  the same figures in the transcript's `run_started` event. Two runs of one task on
+  one model are not comparable if one was shown 8,000 characters of each result and
+  the other 3,000, and that is a difference the run directory would otherwise not
+  mention.
 - **Leaked end-of-turn markers are stripped.** Some models write the markers that
   were supposed to *end* the turn into the turn instead: `kimi-k3` finishes
   commands `… ; true<|close|>argument<|sep|>` and `deepseek-v4-flash` finishes
@@ -741,24 +846,30 @@ stops it afterwards. Everything it runs is offline: no key, no network, no serve
 | Suite | What it covers |
 | --- | --- |
 | `guard` | Every guard verdict — commands, file bodies, shell scripts, python scripts — and every reply the parser has to survive, as a table of cases |
-| `offline` | The whole loop against `fake_droplet.py` with a scripted model — statuses, verification, unreadable checks, secrets, compaction, protocol recovery, script steps |
+| `offline` | The whole loop against `fake_droplet.py` with a scripted model — statuses, verification, unreadable checks, secrets, protocol recovery, script steps, and the context budget: what each window size derives, what is trimmed and what is not, and the reply cap reaching the request |
 | `prompts` | Who answers each y/n question — the operator, `--yes` or `--mode unattended` — and that answering them all still leaves the guard's blocks in force |
 | `engines` | MariaDB, Valkey and MongoDB end to end — compatibility names, a runtime password that has to be rewritten to survive a restart, a vendor repository, authorization turned on after the fact |
 | `fleet` | Several servers — `--host` forms, labelling the ones left unnamed, which server a `HOST:` line means, refusing a step that does not say, scoped checks, peer reachability, and two two-droplet MySQL replication runs judged from both ends |
 | `secrets` | Credentials across runs — one name however it is spelled, the keeper file on the server and back off it, two servers disagreeing, and a second run that logs in with the first run's password without ever seeing it |
 | `wrap` | `wrap_command` and the script pre-check handed to a real bash: syntax pre-flight, pipefail, quoting, heredocs, script paths |
-| `providers` | Model id shapes, key discovery, the provider split, and the price tiers |
+| `providers` | Model id shapes, key discovery, the provider split, the price tiers, and the self-hosted detail endpoint — where it is asked, and that it fills fields in without overwriting any |
 | `openrouter-wire` | The CLI end to end over real HTTP against a stub gateway |
+| `selfhosted-wire` | The same against a stub LM Studio — a bare host completed to `/v1`, no credential sent, no prices reported, the context length and load state read from `/api/v0/models`, the listing surviving a 404 there, a model unloaded mid-run being asked for again, and a run whose cost line says so |
 | `client` | The inference client against `mock_do_server.py` — replies, streaming, reasoning, usage, an effort that travels, a model that refuses two parameters one complaint at a time, a refused key |
 
 `tests/test_dba_live.py` is not in the runner. It drives the harness with a real
-hosted model against the fake droplet — real key, real money — so it stays
-something you run on purpose:
+model against the fake droplet — a real key and real money on a hosted gateway —
+so it stays something you run on purpose:
 
 ```bash
 uv run python tests/test_dba_live.py [model] [--task "..."] [--steps N]
 uv run python tests/test_dba_live.py [model] --pair    # two droplets, replication
+uv run python tests/test_dba_live.py qwen3.8-27b --provider local   # free
 ```
+
+`--provider` takes any gateway from the table above and the model may be a
+fragment of an id. On `local` the run costs nothing, which makes it the cheap way
+to watch a model work a task through before paying a hosted one for the same run.
 
 `--pair` is the multi-server case: two droplets on one private network, passed as a
 bare list the way an operator passes them. The model has to pick which one becomes

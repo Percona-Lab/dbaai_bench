@@ -5,9 +5,10 @@ description = "SSH harness that lets a hosted model do DBA work on a server, wit
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    # The OpenAI SDK is the client for both gateways: DigitalOcean Serverless
-    # Inference and OpenRouter each expose the OpenAI API, so do_dba.inference
-    # only has to vary the base URL and the headers.
+    # The OpenAI SDK is the client for every gateway: DigitalOcean Serverless
+    # Inference, OpenRouter and a self-hosted server (LM Studio, vLLM, llama.cpp)
+    # all expose the OpenAI API, so do_dba.inference only has to vary the base
+    # URL, the headers and whether there is a credential to send at all.
     "openai>=1.40",
     "paramiko>=3.4",
     "rich>=13.0",

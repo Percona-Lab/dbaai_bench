@@ -25,8 +25,11 @@ from do_dba.agent import (
     PIPE_CLOSED_VERIFY,
     RESULT_HINTS,
     SIGPIPE_EXIT,
+    STUB_CHARS,
+    TRIMMED_MARK,
     DBAAgent,
     Limits,
+    estimate_tokens,
 )
 from do_dba.fleet import Fleet, Target
 from do_dba.inference.client import Completion
@@ -56,12 +59,15 @@ class ScriptedClient:
         # What each reply was asked for, so a setting the agent quietly stopped
         # passing on is a failing test rather than a bill nobody can explain.
         self.efforts: list[str | None] = []
+        # And what cap it was given on its own reply, for the same reason.
+        self.caps: list[int | None] = []
 
     def complete(self, *, model, messages, temperature=None, max_tokens=None,
                  effort=None, on_note=None) -> Completion:
         self.calls += 1
         self.prompts.append([dict(m) for m in messages])
         self.efforts.append(effort)
+        self.caps.append(max_tokens)
         reply = self.replies.pop(0) if self.replies else "ACTION: abort\nSUMMARY: out of script"
         # A reply may be given as (text, finish_reason) to model one that the
         # service cut off at the output limit.
@@ -217,8 +223,9 @@ def fleet_of(*droplets) -> Fleet:
 
 
 def build(droplet, store, replies, dry_run=False, approve=None, directory=None, mode="auto",
-          fleet=None, task="Install MySQL and PostgreSQL", costs=None, effort=None):
+          fleet=None, task="Install MySQL and PostgreSQL", costs=None, effort=None, limits=None):
     fleet = fleet if fleet is not None else fleet_of(droplet)
+    limits = limits or Limits(max_steps=20, command_timeout=300.0)
     record = RunRecord(
         directory=directory or (RUNS / ("dry" if dry_run else "main")),
         task=task,
@@ -227,6 +234,7 @@ def build(droplet, store, replies, dry_run=False, approve=None, directory=None, 
         model=MODEL,
         mode=mode,
         dry_run=dry_run,
+        context=", ".join(limits.context_parts()),
         redact=store.redact,
     )
     client = ScriptedClient(replies, costs=costs)
@@ -243,7 +251,7 @@ def build(droplet, store, replies, dry_run=False, approve=None, directory=None, 
         approve=approve or (lambda action, detail, reason: True),
         mode=mode,
         dry_run=dry_run,
-        limits=Limits(max_steps=20, command_timeout=300.0),
+        limits=limits,
         effort=effort,
     )
     return agent, record, client, events
@@ -461,6 +469,31 @@ def main() -> int:
           f"dry run touched the server: {dry_droplet.commands[probes:]}")
     check(failures, not dry_droplet.packages, "dry run installed something")
     check(failures, dry_outcome.status == "done", f"dry run status is {dry_outcome.status}")
+
+    # ----------------------------------------------- an install that only looks
+    # `apt-get install --print-uris <pkg>` and `-s` ask where a package would come
+    # from and what else it would drag in. Both are allowed now (a recorded run was
+    # refused one and spent a step downloading the .deb instead), so the simulator
+    # has to answer them without installing: crediting a dry run as an install would
+    # let a run pass its verdicts having done nothing.
+    look = FakeDroplet()
+    running = dict(look.services)  # sshd is up on a fresh machine; nothing else may join it
+    look.run("apt-get update")
+    uris = look.run("apt-get install --print-uris mysql-server")
+    plan = look.run("apt-get install -s postgresql")
+    check(failures, uris.exit_code == 0 and "mysql-server" in uris.stdout,
+          f"--print-uris said nothing useful: {uris.exit_code} {uris.stdout!r}")
+    check(failures, "http" in uris.stdout and ".deb" in uris.stdout,
+          f"--print-uris printed no archive to fetch: {uris.stdout!r}")
+    check(failures, plan.exit_code == 0 and "Inst postgresql" in plan.stdout,
+          f"-s printed no plan: {plan.exit_code} {plan.stdout!r}")
+    check(failures, not look.packages and look.services == running,
+          f"a lookahead installed something: {look.packages} {look.services}")
+    # A name that does not exist still fails, because apt resolves before it decides
+    # whether it is fetching anything.
+    missing = look.run("apt-get install --print-uris nosuchdb-server")
+    check(failures, missing.exit_code != 0 and "Unable to locate" in missing.stderr,
+          f"a lookahead invented a package: {missing.exit_code} {missing.stdout!r}")
 
     # --------------------------------------------------------- stuck on blocks
     stuck_droplet = FakeDroplet()
@@ -749,6 +782,138 @@ def main() -> int:
     proven = proven_agent.run()
     check(failures, proven.status == "done",
           f"a done proven on the retry gave {proven.status}, want done")
+
+    # ------------------------------------------- what the context window is spent on
+    # Three limits come out of the one number the gateway reports, because a 262K
+    # model should not be driven like a 16K one: how much of a result the model is
+    # shown, how many results stay whole, and how long a single reply may run. Where
+    # no window was reported none of it applies and the fixed limits stand - which
+    # is every other case in this suite, and how the harness worked before it could
+    # ask.
+    big = Limits.for_window(262144, max_steps=20)
+    small = Limits.for_window(16384, max_steps=20)
+    blind = Limits.for_window(0, max_steps=20)
+    check(failures, (big.max_output_chars, big.max_reply_tokens) == (8000, 16384),
+          f"a 262K window gave {big.max_output_chars} chars / {big.max_reply_tokens} tokens")
+    # An eighth of the window, not the 16K ceiling: on a small model a reply that
+    # long would leave nothing for the conversation it is part of.
+    check(failures, (small.max_output_chars, small.max_reply_tokens) == (1200, 2048),
+          f"a 16K window gave {small.max_output_chars} chars / {small.max_reply_tokens} tokens")
+    check(failures, (blind.max_output_chars, blind.max_reply_tokens, blind.history_tokens,
+                     blind.pressure_tokens) == (3000, 0, 0, 0),
+          "a model with no reported window must be driven exactly as before")
+    check(failures, big.max_steps == small.max_steps == 20,
+          "a limit the caller set explicitly was overwritten by a derived one")
+    check(failures, Limits.for_window(262144, max_output_chars=500).max_output_chars == 500,
+          "an explicit max_output_chars should win over the window")
+
+    def observed(limits, count=12, size=6000):
+        """An agent handed `count` results of `size` chars, and its own user messages."""
+        agent, record, _, _ = build(
+            FakeDroplet(), SecretStore(), [], limits=limits,
+            directory=RUNS / f"window-{limits.context_window or 'unknown'}",
+        )
+        for index in range(count):
+            agent._observe(f"--- result {index} ---\n" + "a detail line\n" * (size // 14))
+        return agent, record, [m["content"] for m in agent.messages if m["role"] == "user"]
+
+    # The whole point of asking how large the window is: on a 262K model a dozen
+    # full results fit inside the budget, so the model is still shown all of them at
+    # step 12 instead of six stubs of 400 characters.
+    _, _, roomy = observed(big)
+    check(failures, not any(TRIMMED_MARK in body for body in roomy),
+          "a 262K window was reported and results were trimmed anyway")
+    # Same run, small window: the budget is what bites, not a count. Two whole
+    # results is what 5,120 tokens buys at 6,000 chars each.
+    _, _, tight = observed(small)
+    whole = [body for body in tight if TRIMMED_MARK not in body]
+    check(failures, len(whole) == 2, f"a 16K window kept {len(whole)} results whole, want 2")
+    check(failures, tight[-1] == whole[-1] and TRIMMED_MARK not in tight[-1],
+          "the result the next step answers must never be trimmed")
+    check(failures, all(len(body) <= STUB_CHARS + len(TRIMMED_MARK)
+                        for body in tight if TRIMMED_MARK in body),
+          "a trimmed result was left longer than a stub")
+    check(failures, sum(estimate_tokens(body) for body in whole) <= small.history_tokens,
+          "the results kept whole overran the budget they were sized to")
+    # And with no window: the old count, which several cases above depend on.
+    _, _, counted = observed(blind)
+    check(failures, len([b for b in counted if TRIMMED_MARK not in b]) == 6,
+          "without a window the last six results should stay whole, as they always have")
+
+    # The model's own turns are the term that grows without bound - a reasoning
+    # model's scratchpad comes back inside the reply and stays in the messages - and
+    # nothing used to trim them. Past 85% of the usable window the oldest are cut
+    # down, keeping the last two, so a long run carries on with less of its own
+    # history instead of being refused by the gateway, which would end it.
+    pressed, pressed_record, _, pressed_events = build(
+        FakeDroplet(), SecretStore(), [], limits=small, directory=RUNS / "window-pressure",
+    )
+    for index in range(5):
+        pressed.messages.append({"role": "assistant",
+                                 "content": f"THOUGHT: step {index}\n" + "reasoning aloud\n" * 400})
+        pressed._observe(f"--- result {index} ---\n" + "a detail line\n" * 430)
+    thoughts = [m["content"] for m in pressed.messages if m["role"] == "assistant"]
+    check(failures, len(thoughts) == 5, f"the turns went missing: {len(thoughts)}")
+    check(failures, all(TRIMMED_MARK in body for body in thoughts[:-2]),
+          "the model's oldest turns were not shortened under pressure")
+    check(failures, not any(TRIMMED_MARK in body for body in thoughts[-2:]),
+          "the turns the next step follows on from were shortened")
+    prompt_tokens = sum(estimate_tokens(m["content"]) for m in pressed.messages)
+    check(failures, prompt_tokens <= small.context_window,
+          f"the prompt stands at {prompt_tokens:,} tokens of a {small.context_window:,} window")
+    pressure = [json.loads(line) for line
+                in (pressed_record.directory / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+                if json.loads(line)["kind"] == "context_pressure"]
+    check(failures, pressure and pressure[0]["window"] == 16384,
+          f"the transcript does not say the window filled up: {pressure}")
+    said = [message for kind, message in pressed_events if "window" in message]
+    check(failures, len(said) == 1,
+          f"the operator should hear that once, not {len(said)} times: {said}")
+
+    # ------------------------------------------------------- a reply cap that travels
+    # The cap only does anything if it reaches the request, and the model can only
+    # keep to it if it is told. Both were the whole reason for deriving it: three
+    # recorded replies ran to a gateway's own 65,536-token ceiling, cost 61% of their
+    # run and executed nothing, because a reply cut off mid-command is thrown away.
+    capped_agent, capped_record, capped_client, _ = build(
+        FakeDroplet(), SecretStore(),
+        ["ACTION: run\nCOMMAND: systemctl is-active ssh",
+         "ACTION: done\nVERIFY: systemctl is-active ssh\nSUMMARY: ssh is up"],
+        limits=Limits.for_window(262144, max_steps=20, command_timeout=300.0),
+        directory=RUNS / "reply-cap",
+    )
+    capped = capped_agent.run()
+    check(failures, capped.status == "done", f"the capped run ended {capped.status}")
+    check(failures, capped_client.caps and set(capped_client.caps) == {16384},
+          f"the reply cap did not reach the gateway: {capped_client.caps}")
+    check(failures, "16,384 tokens" in capped_agent.messages[0]["content"],
+          "the model was not told what its reply cap is")
+    uncapped_agent, uncapped_record, uncapped_client, _ = build(
+        FakeDroplet(), SecretStore(),
+        ["ACTION: run\nCOMMAND: systemctl is-active ssh",
+         "ACTION: done\nVERIFY: systemctl is-active ssh\nSUMMARY: ssh is up"],
+        directory=RUNS / "reply-uncapped",
+    )
+    uncapped_agent.run()
+    check(failures, set(uncapped_client.caps) == {None},
+          f"a cap was invented for a model whose window is unknown: {uncapped_client.caps}")
+    check(failures, "cut off mid-command" not in uncapped_agent.messages[0]["content"],
+          "a model with no cap was told about one")
+
+    # And it goes on the record. Two runs of the same task on the same model are not
+    # comparable if one was shown 8,000 characters of each result and the other
+    # 3,000, so the budget is written where a run is read from: the report header and
+    # the first line of the transcript.
+    capped_report = capped_record.write_report().read_text(encoding="utf-8")
+    check(failures, "- **Context:** 262K window, 8,000 chars per result" in capped_report,
+          "the report does not say what the window was spent on")
+    started = json.loads((capped_record.directory / "transcript.jsonl")
+                         .read_text(encoding="utf-8").splitlines()[0])
+    check(failures, "replies capped at 16K" in started.get("context", ""),
+          f"the transcript's first line does not carry the budget: {started.get('context')!r}")
+    check(failures, "**Context:**" not in
+          uncapped_record.write_report().read_text(encoding="utf-8"),
+          "a run with no reported window claimed a context budget")
 
     # ------------------------------------------------------- a cut-off reply
     # A command chopped in half by the output limit still parses as a command.

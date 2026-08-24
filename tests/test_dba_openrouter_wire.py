@@ -236,7 +236,9 @@ def main() -> int:
             client=client, model=MODEL, fleet=fleet, task=task, record=record, store=store,
             prices=prices, emit=lambda kind, message: None,
             approve=lambda action, detail, reason: True, mode="auto",
-            limits=Limits(max_steps=3, command_timeout=30.0),
+            # As cli.py sizes them: this model's listing says a 1M window, so the
+            # reply cap is the 16K ceiling rather than a share of it.
+            limits=Limits.for_window(1_000_000, max_steps=3, command_timeout=30.0),
         )
         outcome = agent.run()
         report_text = record.write_report().read_text(encoding="utf-8")
@@ -261,6 +263,12 @@ def main() -> int:
               and billed_events[0]["cost_source"] == "gateway"
               and abs(billed_events[0]["cost"] - CHARGED) < 1e-12,
               f"the per-reply cost was not logged as the gateway's: {billed_events}")
+
+        run_posts = [r for r in REQUESTS if r["method"] == "POST"][1:]
+        check(failures, run_posts and all(json.loads(r["body"]).get("max_tokens") == 16384
+                                          for r in run_posts),
+              f"the reply cap did not reach the wire: "
+              f"{[json.loads(r['body']).get('max_tokens') for r in run_posts]}")
 
         # The agent was built without an effort, so its own requests must carry no
         # reasoning block at all: an unasked-for effort would change what every

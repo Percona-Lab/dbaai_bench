@@ -16,11 +16,11 @@ from rich.text import Text
 from . import PROJECT_DIR, __version__
 from .agent import MODE_AUTO, MODE_PLAN, MODE_STEP, MODE_UNATTENDED, DBAAgent, Limits
 from .fleet import Fleet, parse_target
-from .inference import providers
+from .inference import details, providers
 from .inference.catalog import Catalog
 from .inference.client import EFFORTS, InferenceClient, InferenceError
 from .inference.config import ConfigError, load_dotenv
-from .inference.pricing import PriceBook, format_cost, format_rate, from_records
+from .inference.pricing import Price, PriceBook, format_cost, format_rate, from_records
 from .report import HostInfo, RunRecord, run_directory
 from .secrets import KEEPER_PATH, SecretStore, read_keeper, write_keeper
 from .ssh import SSHError, SSHRunner, key_fingerprint
@@ -224,10 +224,19 @@ def choose_model(catalog: Catalog, args, provider, screen: Screen) -> str | None
 
     default = provider.choose_default(catalog)
     if not default:
-        screen.error(
-            f"{provider.label} does not list {provider.default_model} and no fallback "
-            "family matched - name a model with -m (see --list-models)"
-        )
+        if not provider.default_model:
+            # A self-hosted server with several models loaded, and no pinned
+            # default to fall back on: which one runs the task is the operator's
+            # call, so the choice is named rather than guessed.
+            screen.error(
+                f"{provider.label} serves {len(catalog.chat)} chat models and pins no "
+                "default - name one with -m (see --list-models)"
+            )
+        else:
+            screen.error(
+                f"{provider.label} does not list {provider.default_model} and no fallback "
+                "family matched - name a model with -m (see --list-models)"
+            )
         return None
     if default != provider.default_model:
         screen.note(f"{provider.default_model} is not available; using {default}")
@@ -291,15 +300,31 @@ def show_network(screen: Screen, fleet: Fleet) -> None:
         screen.warn("         some of these servers cannot reach each other at all")
 
 
-def show_settings(screen: Screen, model: str, provider, prices: PriceBook, args, limits: Limits) -> None:
+def show_settings(screen: Screen, model: str, provider, prices: PriceBook, args, limits: Limits,
+                  info=None) -> None:
     price = prices.get(model)
-    rate = (
-        f"${format_rate(price.input)}/M in {screen.glyphs.sep} ${format_rate(price.output)}/M out"
-        if price
-        else "no published price"
-    )
+    if not provider.metered:
+        # The rate is zero and saying so twice per line adds nothing: what the
+        # operator wants to know is that this run is not on anybody's bill.
+        rate = "no per-token bill"
+    elif price:
+        rate = f"${format_rate(price.input)}/M in {screen.glyphs.sep} ${format_rate(price.output)}/M out"
+    else:
+        rate = "no published price"
     screen.heading("run")
-    screen.line(f"  model    {model}  ({provider.label} {screen.glyphs.sep} {rate})", "white")
+    # The context length only where the gateway reports one: it is what the growing
+    # prompt is measured against, and on a server that loads whatever it was asked
+    # for it is a property of this session rather than of the model.
+    facts = [provider.label, rate]
+    if info is not None and info.context_label:
+        facts.append(info.context_label)
+    separator = f" {screen.glyphs.sep} "
+    screen.line(f"  model    {model}  ({separator.join(facts)})", "white")
+    if info is not None and info.loaded is False:
+        # Said before the run rather than discovered as a stall on step 1. This is
+        # the case first_token_wait exists for; see inference/providers.py.
+        screen.note(f"         {provider.label} does not have this model in memory, so the "
+                    "first step waits while the weights are read off disk")
     if provider.usage_accounting:
         # Worth saying, because it is the difference between a cost line that can
         # be reconciled with the gateway's bill and one that only ought to be.
@@ -316,6 +341,12 @@ def show_settings(screen: Screen, model: str, provider, prices: PriceBook, args,
         f"{limits.command_timeout:.0f}s per command {screen.glyphs.sep} cost cap {cap}",
         "white",
     )
+    parts = limits.context_parts()
+    if parts:
+        # What was made of the window, since it is the operator's business how much
+        # of a result the model gets to see and what a run will cost to keep asking.
+        # Without a reported window this line is absent and the fixed limits apply.
+        screen.line(f"  context  {separator.join(parts)}", "white")
 
 
 def show_outcome(screen: Screen, outcome, record: RunRecord, report: Path,
@@ -473,22 +504,43 @@ def main(argv: list[str] | None = None) -> int:
         headers=provider.headers,
         label=provider.label,
         usage_accounting=provider.usage_accounting,
+        key_help=provider.key_help,
+        read_timeout=provider.read_timeout(),
     )
     try:
         records = client.list_models()
     except InferenceError as exc:
         screen.error(str(exc))
         return 2
+    # A gateway with more to say about its models than the OpenAI listing allows is
+    # asked; one without is not, and one that has stopped answering is not waited on.
+    records = details.described(records, provider.detail_url(), api_key)
     catalog = Catalog(records)
     # OpenRouter publishes its rates in the same response, so every model it
     # serves can be priced exactly instead of falling back to "cost n/a".
     prices.learn(from_records(records))
+    if not provider.metered:
+        # A server the operator already owns sends no bill per token, so its
+        # models are priced at zero rather than left unpriced - "cost n/a" on
+        # every line of a run that cost nothing reads like a failure to work it
+        # out. learn() keeps rates already known, so a model id that also appears
+        # in pricing.json or the hand-kept table is still priced by it.
+        prices.learn({model.id: Price(0.0, 0.0) for model in catalog.all})
 
     if args.list_models:
         for model in catalog.chat:
             price = prices.get(model.id)
-            rate = f"${format_rate(price.input)}/${format_rate(price.output)} per M" if price else "price unpublished"
-            screen.line(f"{model.id:44} {rate}", "white")
+            if not provider.metered:
+                rate = "no per-token bill"
+            else:
+                rate = (f"${format_rate(price.input)}/${format_rate(price.output)} per M"
+                        if price else "price unpublished")
+            # Only the model that is loaded is marked. On a server that holds one
+            # at a time that is the useful half of the fact - it answers at once,
+            # where any other name means waiting for weights to be read off disk -
+            # and marking the nine cold ones would say the same thing nine times.
+            warm = "  loaded" if model.loaded else ""
+            screen.line(f"{model.id:44} {model.context_label:9} {rate}{warm}", "white")
         return 0
 
     task = None if args.probe else read_task(args, screen)
@@ -597,7 +649,13 @@ def _run(args, screen: Screen, fleet: Fleet, client, catalog, prices, provider, 
         if not ask_yes_no(screen, "carry on anyway?", default=False, answered_by=answers_everything(args)):
             return 2
 
-    limits = Limits(
+    # Sized to the model where the gateway said how large its context window is:
+    # how much of a result the model is shown, how many results stay whole, and how
+    # long a single reply may run. Where it said nothing this is the fixed set of
+    # limits the harness has always used. See agent.py's context budget.
+    info = catalog.get(model)
+    limits = Limits.for_window(
+        info.context_window if info else 0,
         max_steps=max(1, args.max_steps),
         command_timeout=max(5.0, args.timeout),
         max_cost=args.max_cost,
@@ -606,7 +664,7 @@ def _run(args, screen: Screen, fleet: Fleet, client, catalog, prices, provider, 
     screen.heading("task")
     for part in task.splitlines():
         screen.line(f"  {part}", "white")
-    show_settings(screen, model, provider, prices, args, limits)
+    show_settings(screen, model, provider, prices, args, limits, info)
 
     store = SecretStore()
     keep_on_servers = not args.no_server_secrets
@@ -629,8 +687,10 @@ def _run(args, screen: Screen, fleet: Fleet, client, catalog, prices, provider, 
                for name, label, values in fleet.host_lines()],
         model=model,
         provider=provider.label,
+        metered=provider.metered,
         mode=args.mode,
         dry_run=args.dry_run,
+        context=", ".join(limits.context_parts()),
         redact=store.redact,
     )
 
