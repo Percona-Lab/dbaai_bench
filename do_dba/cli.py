@@ -14,12 +14,20 @@ from rich.table import Table
 from rich.text import Text
 
 from . import PROJECT_DIR, __version__
-from .agent import MODE_AUTO, MODE_PLAN, MODE_STEP, MODE_UNATTENDED, DBAAgent, Limits
+from .agent import (
+    MODE_AUTO,
+    MODE_PLAN,
+    MODE_STEP,
+    MODE_UNATTENDED,
+    STATUS_API_ERROR,
+    DBAAgent,
+    Limits,
+)
 from .fleet import Fleet, parse_target
 from .inference import details, providers
 from .inference.catalog import Catalog
 from .inference.client import EFFORTS, InferenceClient, InferenceError
-from .inference.config import ConfigError, load_dotenv
+from .inference.config import DEFAULT_RATE_LIMIT_WAIT, ConfigError, load_dotenv
 from .inference.pricing import Price, PriceBook, format_cost, format_rate, from_records
 from .report import HostInfo, RunRecord, run_directory
 from .secrets import KEEPER_PATH, SecretStore, read_keeper, write_keeper
@@ -351,7 +359,10 @@ def show_settings(screen: Screen, model: str, provider, prices: PriceBook, args,
 
 def show_outcome(screen: Screen, outcome, record: RunRecord, report: Path,
                  secrets_path: Path | None, on_servers: bool = False) -> None:
-    style = {"done": "bold green", "aborted": "yellow", "cancelled": "yellow"}.get(outcome.status, "bold red")
+    # Yellow for the endings that are nobody's result: somebody stopped the run, or
+    # the gateway would not serve it. Red is for a run that happened and went wrong.
+    style = {"done": "bold green", "aborted": "yellow", "cancelled": "yellow",
+             STATUS_API_ERROR: "yellow"}.get(outcome.status, "bold red")
     screen.heading("result")
     screen.line(f"  {outcome.status}", style)
     if outcome.summary:
@@ -445,6 +456,12 @@ def build_parser() -> argparse.ArgumentParser:
     limits.add_argument("--max-cost", type=float, default=None, metavar="USD",
                         help="stop once model spend reaches this")
     limits.add_argument("--temperature", type=float, default=0.2, help="sampling temperature (default: 0.2)")
+    limits.add_argument("--rate-limit-wait", type=float, default=None, metavar="SECONDS",
+                        help="how long one request may spend waiting out 429s before the "
+                             "run ends as api-error. Worth raising on a busy free tier, "
+                             "where the alternative is losing the steps already taken "
+                             f"(default: {DEFAULT_RATE_LIMIT_WAIT:.0f}, or "
+                             f"$DO_INFERENCE_RATE_LIMIT_WAIT; 0 fails on the first 429)")
     limits.add_argument("--effort", choices=EFFORTS, default=None,
                         help="ask the model to think before each step, where it can be "
                              "asked - the gateway turns this into whatever the model wants. "
@@ -474,6 +491,9 @@ def main(argv: list[str] | None = None) -> int:
     conflict = unanswerable_prompt(args)
     if conflict:
         parser.error(conflict)
+    if args.rate_limit_wait is not None and args.rate_limit_wait < 0:
+        parser.error("--rate-limit-wait takes seconds of patience; 0 is how you ask "
+                     "for none, which fails on the first 429")
 
     prepare_streams()
     console = Console(
@@ -506,6 +526,10 @@ def main(argv: list[str] | None = None) -> int:
         usage_accounting=provider.usage_accounting,
         key_help=provider.key_help,
         read_timeout=provider.read_timeout(),
+        # None unless it was asked for, which leaves the variable (and then the
+        # default) in charge: the flag is for the run that knows it is on a busy
+        # tier and would rather wait than lose the steps it has taken.
+        rate_limit_budget=args.rate_limit_wait,
     )
     try:
         records = client.list_models()

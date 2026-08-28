@@ -74,8 +74,13 @@ FOREGROUND_SERVERS = {
     "mysqld", "mariadbd", "mongod", "valkey-server", "redis-server",
 }
 # The flags that make one of those return instead: print something and exit, or
-# detach and leave the server running.
-BACKGROUNDING_FLAGS = {"--version", "-V", "--help", "--fork", "--daemonize"}
+# detach and leave the server running. `--print-defaults` prints the options the
+# config files actually set and stops before the server starts, which is how a step
+# finds out that its drop-in never landed - a recorded run asked three times, was
+# refused three times, and went looking for the setting the long way round. Two more
+# runs used it against mariadbd, and were allowed only because this rule did not exist
+# yet: it is ordinary practice, not a way of starting a server.
+BACKGROUNDING_FLAGS = {"--version", "-V", "--help", "--fork", "--daemonize", "--print-defaults"}
 # And the flags that hand the daemon one job and end when it is done: these never
 # open the port or hold the terminal, so the reason above does not apply to them.
 # `--initialize`/`--initialize-insecure` build a data directory and exit, which is
@@ -86,6 +91,26 @@ BACKGROUNDING_FLAGS = {"--version", "-V", "--help", "--fork", "--daemonize"}
 # `--validate-config` reads the config, says what is wrong with it and stops, which is
 # the one way to find a bad setting without restarting the service to discover it.
 ONE_SHOT_FLAGS = {"--initialize", "--initialize-insecure", "--validate-config"}
+# `mongod --outputConfig` belongs with them: it resolves the config file and the command
+# line, prints the result as YAML and exits, which is how a step finds out what the server
+# will actually read. A version that does not have the flag rejects it and exits too, so
+# either way nothing starts.
+ONE_SHOT_FLAGS |= {"--outputConfig"}
+# Some of those listings are asked for with a value rather than a flag, and a value is two
+# tokens, which no set of flag names can match. `--setParameter help` is the recorded one:
+# mongod answers it with the server parameters it accepts and stops, and a build that does
+# not treat `help` as a listing rejects it as a parameter name and stops as well - what it
+# never does is open a port. Two recorded blocks, both piping that listing into grep to
+# find which knob a server that would not start might have (`tcmalloc`, `rseq`, `kernel`),
+# and both were refused a listing on the grounds that it was a server start.
+LISTING_VALUES = {("--setParameter", "help")}
+# A flag is not the only way one of them returns. `/usr/bin/ldd` is a shell script that
+# sets this variable and runs the binary: the dynamic loader prints the shared libraries
+# it would load and exits before main, so `LD_TRACE_LOADED_OBJECTS=1 /path/to/mysqld` -
+# what ldd runs, and what a step writes by hand when ldd is not installed - opens no
+# port and holds nothing. Reading it as a server start refuses the ordinary way to find
+# out why a tarball build will not run: which library it is missing.
+LOADER_TRACE = "LD_TRACE_LOADED_OBJECTS"
 # valkey-cli / redis-cli options that consume the next token, so what follows is
 # not the command being sent to the server.
 CLI_VALUE_FLAGS = {
@@ -220,8 +245,18 @@ _RULES: list[tuple[re.Pattern[str], str, str]] = [
 ]
 
 
-def classify(command: str, _depth: int = 0, _quotes: bool = True) -> Verdict:
-    """Judge a shell command about to be run as root."""
+def classify(command: str, _depth: int = 0, _quotes: bool = True, _executed: bool = True,
+             _background: bool = False) -> Verdict:
+    """Judge a shell command about to be run as root.
+
+    `_executed` is false for text that is only being written down - the body of a
+    heredoc that lands in a file, a file body handed to write_file - where the few
+    rules about what would hang this step do not apply, because nothing here runs it.
+
+    `_background` is true when the caller already knows this whole text runs behind an
+    `&`: `bash -c 'mysqld' &` backgrounds the server just as surely as `mysqld &` does,
+    and the payload is judged by recursing here, where the `&` is no longer in sight.
+    """
     text = command.strip()
     if not text:
         return Verdict(BLOCK, "empty command")
@@ -242,8 +277,8 @@ def classify(command: str, _depth: int = 0, _quotes: bool = True) -> Verdict:
                                   "fail partway through; fix the quoting and send it again")
 
     saw_command = False
-    for segment in _segments(text):
-        verdict = _judge_segment(segment, _depth)
+    for segment, background in _segments(text):
+        verdict = _judge_segment(segment, _depth, _executed, _background or background)
         if verdict.level != ALLOW:
             return verdict
         saw_command = saw_command or bool(segment.strip())
@@ -256,15 +291,19 @@ def classify(command: str, _depth: int = 0, _quotes: bool = True) -> Verdict:
     return Verdict(ALLOW)
 
 
-def _segments(text: str) -> list[str]:
+def _segments(text: str) -> list[tuple[str, bool]]:
     """The separate commands on a line, split on the shell's own operators.
 
     Quote-aware, because a plain split is not: `grep -E 'mariadb|mysql'` comes
     apart into three pieces, one of which reads exactly like a bare `mysql`
     client session - and a read-only inspection command gets blocked for a pipe
     that is not a pipe.
+
+    Each segment comes back with the one thing the split would otherwise destroy:
+    whether the operator that ended it was a single `&`, which is the difference
+    between a command that holds this step and one that returns immediately.
     """
-    segments: list[str] = []
+    segments: list[tuple[str, bool]] = []
     buffer: list[str] = []
     quote = ""
     index = 0
@@ -293,19 +332,25 @@ def _segments(text: str) -> list[str]:
                 index += 1
                 continue
         if char in _OPERATORS:
-            segments.append("".join(buffer))
+            # A lone `&` backgrounds what came before it. `&&` is a conditional and
+            # backgrounds nothing; the redirection cases were taken above.
+            background = char == "&" and text[index + 1:index + 2] != "&"
+            segments.append(("".join(buffer), background))
             buffer = []
             while index < len(text) and text[index] in _OPERATORS:
                 index += 1  # `||`, `&&` and a run of `;` all separate the same way
             continue
         buffer.append(char)
         index += 1
-    segments.append("".join(buffer))
+    segments.append(("".join(buffer), False))  # nothing followed it, so nothing backgrounded it
     return segments
 
 
-# `<<EOF`, `<<-EOF`, `<<'EOF'`: the body that follows is data, not shell text.
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# `<<EOF`, `<<-EOF`, `<<'EOF'`: the body that follows is data, not shell text. The
+# lookarounds are the ones protocol.py uses for the same job: `<<<word` is a here-string,
+# complete on its own, and read as a heredoc named `word` it would swallow the rest of a
+# script as that heredoc's body.
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def _unterminated_quote(text: str) -> str:
@@ -360,7 +405,8 @@ def _without_heredoc_bodies(text: str) -> str:
     return "\n".join(kept)
 
 
-def _judge_segment(segment: str, depth: int = 0) -> Verdict:
+def _judge_segment(segment: str, depth: int = 0, executed: bool = True,
+                   background: bool = False) -> Verdict:
     tokens = _tokens(segment)
     if not tokens:
         return Verdict(ALLOW)
@@ -376,7 +422,7 @@ def _judge_segment(segment: str, depth: int = 0) -> Verdict:
     if program in SHELLS and depth < 3:
         inner = _shell_payload(args)
         if inner:
-            return classify(inner, depth + 1)
+            return classify(inner, depth + 1, _executed=executed, _background=background)
 
     # `su postgres -c '<script>'` is `bash -c` in another hat, and it was a way past
     # every rule here: the script was never looked at, so `su -c 'rm -rf /'` classified
@@ -389,7 +435,7 @@ def _judge_segment(segment: str, depth: int = 0) -> Verdict:
             return Verdict(BLOCK, f"{program} without a command opens an interactive shell "
                                   f"and would hang; use {program} ... -c '<command>'")
         if depth < 3:
-            return classify(inner, depth + 1)
+            return classify(inner, depth + 1, _executed=executed, _background=background)
 
     if program in REPL_WITHOUT_ARGS and not args:
         return Verdict(BLOCK, f"bare {program} opens a REPL and would hang; pass it something to run")
@@ -429,16 +475,23 @@ def _judge_segment(segment: str, depth: int = 0) -> Verdict:
         if not _any_flag(args, {"-y", "--yes", "--assume-yes", "-q", "-qq"} | lookahead):
             return Verdict(BLOCK, "apt install without -y will stall on a prompt")
 
-    if program in {"mysql", "mariadb"} and not _any_flag(args, {"-e", "--execute", "-f", "--version", "-V"}):
+    # A client asked for help prints its options and exits like the server does, and
+    # `mysql --help` prints the config files it read on the way - which is the cheapest
+    # answer to "is this client even reading my.cnf". Recorded once, refused as a client
+    # session. `-?` is the same flag; `-h` is deliberately absent, it means host here.
+    if program in {"mysql", "mariadb"} and not _any_flag(
+            args, {"-e", "--execute", "-f", "--version", "-V", "--help", "-?", "--print-defaults"}):
         if "<" not in segment and "<<" not in segment:
             return Verdict(BLOCK, "bare mysql opens a client session; use mysql -e '<sql>'")
 
-    if program == "psql" and not _any_flag(args, {"-c", "--command", "-f", "--file", "-l", "--list", "--version", "-V"}):
+    if program == "psql" and not _any_flag(args, {"-c", "--command", "-f", "--file", "-l", "--list",
+                                                 "--version", "-V", "--help", "-?"}):
         if "<" not in segment and "<<" not in segment:
             return Verdict(BLOCK, "bare psql opens a client session; use psql -c '<sql>'")
 
     # mongosh takes a script instead of a statement, and a .js path counts as one.
-    if program in {"mongosh", "mongo"} and not _any_flag(args, {"--eval", "-e", "-f", "--file", "--version"}):
+    if program in {"mongosh", "mongo"} and not _any_flag(args, {"--eval", "-e", "-f", "--file",
+                                                                "--version", "--help"}):
         script = any(arg.endswith((".js", ".mongodb")) for arg in args)
         if not script and "<" not in segment:
             return Verdict(BLOCK, f"bare {program} opens a shell session; use {program} --eval '<js>'")
@@ -455,9 +508,35 @@ def _judge_segment(segment: str, depth: int = 0) -> Verdict:
             return Verdict(BLOCK, f"{words[0]} streams until interrupted and nothing here can "
                                   "interrupt it; query the state instead")
 
-    if program in FOREGROUND_SERVERS and not _any_flag(args, BACKGROUNDING_FLAGS | ONE_SHOT_FLAGS):
+    # Only where it would actually hang. In a file body the same line is the point of the
+    # file: a unit's ExecStart and a wrapper script's `exec mongod` have to stay in the
+    # foreground, that is how systemd supervises a service, and refusing them refused the
+    # very thing the rule asks for. Three recorded blocks, and one model left a comment
+    # saying the wrapper existed "to bypass the safety guard's detection of mongod in
+    # ExecStart" - a rule that teaches models to hide from it is worse than no rule.
+    # A trailing `&` answers the reason above - the step returns, nothing hangs - and what
+    # is left is real but smaller: the server is running outside systemd, so `systemctl
+    # status` disagrees with `ps` for the rest of the run and nothing restarts it. Three
+    # recorded blocks were this shape, and two of them were the documented way out of a
+    # lost root password: a `--skip-grant-tables --skip-networking` server, which is
+    # exactly what systemd will not start for you. So it goes to an operator instead of
+    # being refused, and an unattended run with --yes proceeds.
+    if executed and program in FOREGROUND_SERVERS \
+            and not _any_flag(args, BACKGROUNDING_FLAGS | ONE_SHOT_FLAGS) \
+            and not _asks_for_a_listing(args) \
+            and not _traces_libraries(segment):
+        if background:
+            return Verdict(CONFIRM, f"{program} in the background will not hold this step, but it "
+                                    f"runs outside systemd, where the next step looks for it")
+        # The reason names the bounded form as well as the supervised one, because the
+        # recorded steps that hit this were not trying to run a service by hand: they were
+        # trying to see why the service would not start, after systemctl had already failed
+        # and journalctl had not said enough. `timeout 20 mongod --config ...` answers that
+        # and returns on its own, which is why it is allowed - and a reason that only says
+        # "use systemctl" to a model whose systemctl is broken teaches it to hide instead.
         return Verdict(BLOCK, f"{program} started this way stays in the foreground until the "
-                              f"command timeout; start it with systemctl instead")
+                              f"command timeout; start it with systemctl, or to see why it will "
+                              f"not start, bound the direct run: timeout 20 {program} ...")
 
     if program == "dpkg-reconfigure" and not _any_flag(args, {"-f", "--frontend"}):
         return Verdict(BLOCK, "dpkg-reconfigure is interactive without -f noninteractive")
@@ -567,10 +646,11 @@ def classify_file_content(content: str, path: str = "") -> Verdict:
         if pattern.search(content):
             return Verdict(CONFIRM, reason)
     # Writing a script and then running it would otherwise slip every command
-    # rule, since the write is just bytes and the run is just a path.
+    # rule, since the write is just bytes and the run is just a path. Judged as
+    # text that is not running yet, though: see classify.
     kind = script_kind(content, path)
     if kind:
-        return classify_script_body(content, kind)
+        return classify_script_body(content, kind, executed=False)
     return Verdict(ALLOW)
 
 
@@ -598,11 +678,11 @@ def looks_like_script(content: str, path: str = "") -> bool:
     return bool(script_kind(content, path))
 
 
-def classify_script_body(body: str, interpreter: str = "bash") -> Verdict:
+def classify_script_body(body: str, interpreter: str = "bash", executed: bool = True) -> Verdict:
     """Judge a whole script, by the interpreter that will read it."""
     if "python" in (interpreter or "").lower():
         return classify_python_script(body)
-    return classify_script(body)
+    return classify_script(body, executed)
 
 
 # Lines that are shell structure rather than a command to judge.
@@ -612,31 +692,103 @@ _SCRIPT_NOISE = re.compile(
 )
 
 
-def classify_script(body: str) -> Verdict:
+# Where a heredoc body ends up when the line opening it writes it to a file. The
+# character class keeps `2>&1` out of it, and the leading `-` keeps tee's own flags out.
+_REDIRECT_TARGET = re.compile(r">>?\s*[\"']?([^\s\"'|;&<>]+)")
+_TEE_TARGET = re.compile(r"\btee\b\s+(?:(?:-a|--append)\s+)*[\"']?([^\s\"'|;&<>-][^\s\"'|;&<>]*)")
+
+
+def _written_file(line: str) -> str:
+    """The path this line writes to, or "" if its output is not going to a file.
+
+    The first one, so a line opening two heredocs names the first file for both. What
+    that costs is a path in a reason, not a verdict: both bodies are still judged.
+    """
+    for pattern in (_REDIRECT_TARGET, _TEE_TARGET):
+        found = pattern.search(line)
+        if found:
+            return found.group(1)
+    return ""
+
+
+def _continues(line: str) -> bool:
+    """Does a backslash at the end of this line join the next one to it?
+
+    An even run of backslashes is escaped backslashes, and ends the line.
+    """
+    stripped = line.rstrip()
+    return (len(stripped) - len(stripped.rstrip("\\"))) % 2 == 1
+
+
+def classify_script(body: str, executed: bool = True) -> Verdict:
     """Judge a shell script line by line and keep the strictest verdict.
 
     Line by line rather than whole-body, because several rules are written with
-    `[^|;&]*` and would otherwise match across unrelated lines.
+    `[^|;&]*` and would otherwise match across unrelated lines. A line means a
+    logical one: a command split over several physical lines with backslashes is
+    joined back up first, because taken apart the halves are two commands the script
+    never runs. Seven recorded blocks were exactly that, and every one of them was
+    wrong - `docker run -d \\` ... `mongod --config x` read as a bare mongod, `gdb
+    -batch ... \\` ... `/usr/bin/mongod core` read as a server start when the program
+    was gdb, and `mysql ... \\` ... `-e "ALTER USER ..."` read as a client session
+    because the statement was on the next line.
 
     The line number is in the reason because a script is not a command: told only
     that something in sixty lines drops a database, an operator has to find it,
     and the model has to guess which line to rewrite.
     """
     worst = Verdict(ALLOW)
-    for number, line in enumerate(body.splitlines(), start=1):
+    lines = body.splitlines()
+    index = 0
+    while index < len(lines):
+        number = index + 1
+        line = lines[index]
+        index += 1
         if _SCRIPT_NOISE.match(line):
             continue
+        while _continues(line) and index < len(lines):
+            line = line.rstrip()[:-1] + lines[index]  # what the shell does with the pair
+            index += 1
+
+        found: list[Verdict] = []
         # No quote check here: a string in a script may legitimately open on one
         # line and close on another, and judging lines in isolation would read
         # every such string as broken.
-        verdict = classify(line, _quotes=False)
-        if verdict.level == ALLOW:
-            continue
-        reason = f"line {number} of the script, {line.strip()[:80]!r}: {verdict.reason}"
-        if verdict.level == BLOCK:
-            return Verdict(BLOCK, reason)
-        if worst.level == ALLOW:
-            worst = Verdict(CONFIRM, reason)
+        verdict = classify(line, _quotes=False, _executed=executed)
+        if verdict.level != ALLOW:
+            shown = " ".join(line.split())[:80]
+            found.append(Verdict(verdict.level,
+                                 f"line {number} of the script, {shown!r}: {verdict.reason}"))
+
+        # A heredoc whose body goes to a file is file content, not shell text. Judged
+        # as commands, `exec mongod` in the wrapper script a step writes reads as a
+        # server start, and a my.cnf reads as whatever its settings happen to look
+        # like; judged as a file, the config rules get it right. A heredoc with no
+        # file behind it - `mysql <<EOF`, `bash <<EOF` - is text a program will run,
+        # so it is left to the rules above exactly as it was.
+        terminators = [match.group(2) for match in _HEREDOC.finditer(line)]
+        path = _written_file(line) if terminators else ""
+        if path:
+            for terminator in terminators:
+                collected: list[str] = []
+                while index < len(lines) and lines[index].strip() != terminator:
+                    collected.append(lines[index])
+                    index += 1
+                index += 1  # step over the terminator, which is not content
+                verdict = classify_file_content("\n".join(collected) + "\n", path)
+                if verdict.level != ALLOW:
+                    # A line number from inside the body counts lines of that file, not
+                    # of the script, and one reason saying "script" twice helps nobody.
+                    inner = re.sub(r"^line (\d+) of the script,",
+                                   r"line \1 of the file,", verdict.reason)
+                    found.append(Verdict(verdict.level,
+                                         f"line {number} of the script writes {path}: {inner}"))
+
+        for verdict in found:
+            if verdict.level == BLOCK:
+                return verdict
+            if worst.level == ALLOW:
+                worst = verdict
     return worst
 
 
@@ -971,6 +1123,12 @@ def _fill(holes: re.Pattern, template: tuple[str, bool], values: list[ast.expr])
     return holes.sub(one, text), whole
 
 
+# `name=$(prog ...)`, and the backtick spelling of the same thing: an assignment whose
+# value is the output of a command. Group 1 is the first word inside the substitution,
+# and empty when a space follows the paren. `$((` is arithmetic, not a command.
+_ASSIGNED_SUBSTITUTION = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[\"']?(?:\$\((?!\()|`)\s*(\S*)")
+
+
 def _tokens(segment: str) -> list[str]:
     """Split a segment and skip past wrappers to the program actually invoked."""
     try:
@@ -983,6 +1141,19 @@ def _tokens(segment: str) -> list[str]:
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        # The program being run is the first word inside the substitution, not the token
+        # after it. Read as a plain assignment and stepped over, ldd's argument was taken
+        # for the program instead, so `missing=$(ldd "$PSM/bin/mysqld" | awk ...)` came
+        # back as a server start - twice in one recorded run, refusing the ordinary way to
+        # find which library a tarball build is missing. The model's answer was to glob the
+        # bin directory so that no command line named mysqld directly.
+        opens = _ASSIGNED_SUBSTITUTION.match(token)
+        if opens and opens.group(1):
+            tokens = [opens.group(1)] + tokens[index + 1:]
+            if tokens[-1].endswith(")"):
+                tokens[-1] = tokens[-1][:-1]  # the substitution's own closing paren
+            index = 0
+            continue
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
             index += 1  # leading VAR=value assignment
             continue
@@ -1047,6 +1218,44 @@ def _cli_words(args: list[str]) -> list[str]:
             continue
         words.append(arg)
     return words
+
+
+def _traces_libraries(segment: str) -> bool:
+    """Is the loader being asked to list a binary's libraries rather than run it?
+
+    Only the assignments in front of the program count, which is where the shell puts
+    them into its environment: `mysqld --a=LD_TRACE_LOADED_OBJECTS=1` is still a server
+    start. An empty value is not tracing either - the loader wants a value there - so
+    that form keeps the block, which is the safe way round.
+    """
+    try:
+        tokens = shlex.split(segment, comments=True)
+    except ValueError:
+        tokens = segment.split()
+    for token in tokens:
+        name, sep, value = token.partition("=")
+        if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            if name == LOADER_TRACE and value:
+                return True
+            continue  # some other assignment, still in front of the program
+        if token.rsplit("/", 1)[-1] not in WRAPPERS:
+            return False  # the program itself, reached without one
+    return False
+
+
+def _asks_for_a_listing(args: list[str]) -> bool:
+    """Is one of LISTING_VALUES here - an option whose value asks for a list, not a start?
+
+    `--setParameter help` and `--setParameter=help` are the same request. A value that
+    only begins with `help` is not one: `--setParameter helpText=on` sets a parameter.
+    """
+    for flag, value in LISTING_VALUES:
+        for index, arg in enumerate(args):
+            if arg == flag and args[index + 1:index + 2] == [value]:
+                return True
+            if arg == f"{flag}={value}":
+                return True
+    return False
 
 
 def _has_word(args: list[str], word: str) -> bool:

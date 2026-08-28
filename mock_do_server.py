@@ -8,6 +8,15 @@ Behaviours exercised:
   * model "picky-model"        -> 400 on temperature and on reasoning, one at a
                                   time, which is what a model that refuses more
                                   than one parameter does (tests param fallback)
+  * model "busy-model"         -> 429 with Retry-After twice, then serves the reply,
+                                  which is a per-minute limit clearing (tests the wait)
+  * model "overloaded-model"   -> 429 every time, and no Retry-After, so the client
+                                  has only its own backoff schedule to go on
+  * model "padded-model"       -> 200 with a body of newlines twice, then serves the
+                                  reply: the keep-alive padding a queued request gets,
+                                  with the reply that should have followed it missing
+  * model "garbled-model"      -> 200 with prose in the body every time, as a proxy
+                                  or an upstream error page does
   * model "reasoner-1"         -> emits reasoning_content
   * model "router:general"     -> reports a different served model, as a router does
   * prompt containing "CACHED" -> usage reports prompt_tokens_details.cached_tokens
@@ -17,7 +26,8 @@ Behaviours exercised:
 """
 
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODELS = [
     {"id": "anthropic-claude-opus-5", "object": "model", "owned_by": "anthropic", "context_window": 1000000},
@@ -26,6 +36,10 @@ MODELS = [
     {"id": "router:general", "object": "model", "owned_by": "digitalocean"},
     {"id": "llama-4-maverick", "object": "model", "owned_by": "meta", "context_window": 128000},
     {"id": "picky-model", "object": "model", "owned_by": "test"},
+    {"id": "busy-model", "object": "model", "owned_by": "test"},
+    {"id": "overloaded-model", "object": "model", "owned_by": "test"},
+    {"id": "padded-model", "object": "model", "owned_by": "test"},
+    {"id": "garbled-model", "object": "model", "owned_by": "test"},
     {"id": "reasoner-1", "object": "model", "owned_by": "test"},
     {"id": "openai-gpt-image-1", "object": "model", "owned_by": "openai"},
 ]
@@ -34,8 +48,23 @@ MODELS = [
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    # How many times a model has been asked each question. Keyed by the prompt as
+    # well as the model, because a retry sends the same request again: every test
+    # gets its own refusals without needing the server restarted between them.
+    calls: dict[tuple[str, str], int] = {}
+    calls_lock = threading.Lock()  # the server is threaded; counting is not atomic
+    BUSY_REFUSALS = 2
+    PADDED_REFUSALS = 2
+
     def log_message(self, *args):
         pass
+
+    def _seen(self, model, prompt):
+        """How many times this exact request has arrived, this one included."""
+        with Handler.calls_lock:
+            count = Handler.calls.get((model, prompt), 0) + 1
+            Handler.calls[(model, prompt)] = count
+            return count
 
     def _authed(self):
         header = self.headers.get("Authorization", "")
@@ -48,13 +77,38 @@ class Handler(BaseHTTPRequestHandler):
         self._json(401, {"error": {"message": "invalid model access key"}})
         return False
 
-    def _json(self, status, payload):
+    def _json(self, status, payload, headers=None):
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _too_many(self, retry_after=None):
+        """A 429, with the gateway's own figure for the wait where it has one."""
+        return self._json(
+            429,
+            {"error": {"message": "Rate limit exceeded: free-models-per-min",
+                       "type": "rate_limit_exceeded"}},
+            {"Retry-After": str(retry_after)} if retry_after is not None else None,
+        )
+
+    def _not_json(self, body):
+        """A 200 whose body is not the JSON the API promises.
+
+        Content-Type still says application/json, which is what makes this hard to
+        catch: nothing in the response says anything is wrong until the client tries
+        to parse it, by which point the SDK's own retries are behind it.
+        """
+        raw = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def do_GET(self):
         if self.path.rstrip("/") != "/v1/models":
@@ -86,6 +140,22 @@ class Handler(BaseHTTPRequestHandler):
         for message in body.get("messages", []):
             if message.get("role") == "user":
                 prompt = str(message.get("content", ""))
+
+        # A limit that clears, and one that does not. The second sends no
+        # Retry-After, which is the common case: most gateways return a bare 429
+        # and leave the caller to guess how long a minute is.
+        if model == "overloaded-model":
+            return self._too_many()
+        if model == "busy-model" and self._seen(model, prompt) <= Handler.BUSY_REFUSALS:
+            return self._too_many(retry_after=1)
+
+        # And two ways of answering 200 without answering. The padding is what a
+        # queued OpenRouter request is sent while it waits; a body of nothing but
+        # padding is what arrives when the reply it was covering for never comes.
+        if model == "garbled-model":
+            return self._not_json("upstream error: no healthy provider\n")
+        if model == "padded-model" and self._seen(model, prompt) <= Handler.PADDED_REFUSALS:
+            return self._not_json("\n" * 617)
         # A router alias bills as whatever model it picked, and says so in the
         # "model" field of every frame it sends back.
         served = "llama-4-maverick" if model.startswith("router:") else model
@@ -160,4 +230,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", 8899), Handler).serve_forever()
+    # Threaded because these are keep-alive HTTP/1.1 connections and a test may
+    # hold more than one: a single-threaded server sits in the first connection's
+    # read waiting for a request that is never coming, and a second client's
+    # connection is never accepted at all. That deadlock reads as a model that
+    # accepted the request and then said nothing, which is a real failure the
+    # harness has a timeout for - so it takes the whole timeout to report.
+    ThreadingHTTPServer(("127.0.0.1", 8899), Handler).serve_forever()

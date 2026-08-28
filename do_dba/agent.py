@@ -233,6 +233,76 @@ def filter_matched_nothing(result) -> bool:
     return any(not QUIET_GREP.search(flags) for flags in GREP_STAGE.findall(command))
 
 
+# The third pipefail edge, and the one that reads as good news: the step exits 0 and
+# something inside it has already failed. pipefail makes the step's code the last
+# command's, so a failure in the middle of a `;`-chain, inside a subshell, or behind an
+# `|| true` leaves a 0 with the diagnosis on stderr and nothing else to say so. 25 of
+# the 1,293 executed steps in the recorded runs came back that way, across 9 runs.
+#
+# The worst is a repo file dnf would not parse: `Warning: failed loading
+# '/etc/yum.repos.d/percona.repo', skipping.` on 8 steps of two runs, six of them in
+# one run that read every exit 0 and every "Nothing to do" as the repository being
+# configured, installed percona-release twice more, searched for four different
+# package names, and finished having installed nothing. The next is an unterminated
+# heredoc, which bash only warns about before ending the body at EOF: `cat >
+# gr.cnf <<'EOF'` wrote a zero-length file, came back 0, and one run configured a
+# three-node cluster from empty config files - 5 steps across two runs, all of them
+# now caught in the parser (see protocol._HEREDOC) but reachable still inside a
+# COMMAND_BEGIN block or a script. The singletons are the same shape: `awk: fatal:
+# cannot open file /etc/mysql/debian.cnf`, `chown: ... Operation not permitted` on a
+# key file, `wget: invalid option -- 's'`, `Job for mysql.service failed`.
+#
+# The note is an explanation, not a verdict: the step is not counted as a failure - it
+# exited 0 and the harness has no better evidence than that - and it does not clear the
+# consecutive-failure count either way, because that is what the exit code decides.
+STDERR_FAILURE = re.compile(
+    r"\bE:\s"                                              # apt's own prefix
+    r"|\bERROR\b|\bError\b|\berror:"
+    r"|\bfatal\b|\bFATAL\b"
+    r"|command not found|No such file or directory|not found\b"
+    r"|Permission denied|Operation not permitted"
+    r"|\bfailed\b|\bFailed\b|\bcannot\b|\bCannot\b|\bunable to\b|\bUnable to\b"
+    r"|invalid option|unbound variable|ambiguous redirect"
+    r"|delimited by end-of-file"                            # the heredoc that ran out
+    r"|no valid OpenPGP data|nothing exported"              # gpg, on an empty keyring
+)
+# Failure-shaped lines that mean nothing at all, and are on far more steps than the
+# real ones: debconf says "unable to initialize frontend" on every noninteractive
+# install, perl says "Setting locale failed" on a fresh image, and curl's write error
+# is the closed pipe PIPE_CLOSED_NOTE already explains. Without this the note would
+# arrive on ordinary apt output and be worth nothing by the third time.
+STDERR_NOISE = re.compile(
+    r"^(?:debconf|dpkg-preconfigure|perl|locale|update-alternatives):"
+    r"|Failure writing output to destination"
+    r"|apt-key is deprecated"
+    r"|apt does not have a stable CLI interface"
+)
+QUIET_FAILURE_NOTE = (
+    "harness: that step exited 0, but something inside it printed a failure to stderr: "
+    "{line}. Exit 0 is the last command's verdict, not the step's - a command that "
+    "failed earlier in the step, in a subshell, in a pipeline stage that was not the "
+    "last, or behind an `|| true` does not change it. So do not read the 0 as the work "
+    "having happened: check what that line names, and put the commands in an "
+    "ACTION: script with `set -e` if you want the step to stop where it broke."
+)
+
+
+def failed_quietly(result) -> str:
+    """The first line of stderr that says something failed, on a step that exited 0.
+
+    The line rather than a flag, because the note quotes it: on a step whose stderr is
+    forty lines of apt the one that matters is the point of the whole note.
+    """
+    if result.exit_code != 0 or getattr(result, "timed_out", False):
+        return ""  # a failure reports itself; the exit code is already the diagnosis
+    for line in (result.stderr or "").splitlines():
+        text = line.strip()
+        if text and not CHECK_NOISE.match(text) and not STDERR_NOISE.search(text) \
+                and STDERR_FAILURE.search(text):
+            return text
+    return ""
+
+
 def check_explains_nothing(output: str) -> bool:
     """Did a failed check come back with nothing that could say why it failed?
 
@@ -265,9 +335,17 @@ MODE_AUTO = "auto"
 MODE_UNATTENDED = "unattended"
 
 
+# A run the gateway ended, as distinct from one the model ended. `failed` is the
+# model's word - it was asked for a step and what came back could not be used -
+# and reading a 429 or a dead endpoint as that has a cost beyond the wrong word:
+# dbrun's leaderboard scores a `failed` cell as a model that tried and got
+# nothing, which is what a rate limit at step 2 looked like on one.
+STATUS_API_ERROR = "api-error"
+
+
 @dataclass
 class Outcome:
-    status: str  # done | unverified | aborted | exhausted | failed | cancelled | stuck
+    status: str  # done | unverified | aborted | exhausted | failed | api-error | cancelled | stuck
     summary: str = ""
     steps: int = 0
     executed: int = 0
@@ -465,6 +543,10 @@ class DBAAgent:
         self.cost = 0.0
         self.cost_complete = True
         self.last_finish = ""  # why the last reply ended; "length" means cut off
+        # What the gateway said, when it is the gateway that stopped the run rather
+        # than the model. Cleared by a reply that arrives, so it only ever describes
+        # the request that just failed.
+        self.api_error = ""
         self._observation_indices: list[int] = []
         # Said once per run, however many steps are trimmed under pressure.
         self._pressure_noted = False
@@ -514,7 +596,9 @@ RULES
    stderr for the same reason - it carries the diagnosis - so no `2>/dev/null` on a
    step you may have to debug, and `curl -sS`/`wget` without `-q` when a download
    might fail.
-7. Read failures and adapt. Never send a command that just failed unchanged.
+7. Read failures and adapt. Never send a command that just failed unchanged. Read the
+   output as well as the exit code: 0 is the last command's verdict, not the step's, so
+   a step of several commands can come back 0 with a failure in the middle of it.
 8. Prefer distribution packages and systemd units over source builds or containers
    unless the task asks for them. MongoDB is the one exception: it is not in
    Ubuntu's archive, so add the vendor repository with its key in
@@ -661,7 +745,14 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
 
             step = self._next_step(index)
             if step is None:
-                return self._finish("failed", "the model never produced a usable step", index - 1, executed)
+                # Two different endings arrive here, and they were one word until a
+                # rate-limited run reported "the model never produced a usable step"
+                # over a transcript whose step 1 had exited 0. What the model did
+                # and what the gateway did are separate facts and both are said.
+                if self.api_error:
+                    return self._finish(STATUS_API_ERROR, self._gave_up_at(index, self.api_error),
+                                        index - 1, executed)
+                return self._finish("failed", self._unusable_at(index), index - 1, executed)
 
             if step.extra_actions:
                 self.emit("note", "the reply held more than one step; only the first was used")
@@ -800,6 +891,8 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
                 record.note = "the reader closed the pipe; the writer's own exit code is lost"
             elif filter_matched_nothing(result):
                 record.note = "nothing matched the filter; the step's own exit code is lost in it"
+            elif failed_quietly(result):
+                record.note = "exited 0 with a failure on stderr; the 0 covers the last command only"
             self.record.add_step(record)
             if self.store.unsaved and self.persist is not None:
                 # A credential came into being in that step. Put it somewhere it
@@ -929,8 +1022,10 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
         except InferenceError as exc:
             self.emit("error", str(exc))
             self.record.event("model_error", error=str(exc))
+            self.api_error = str(exc)
             return None
 
+        self.api_error = ""
         self.last_finish = completion.finish_reason
         if completion.usage:
             # The gateway's own figure where it gives one: it is what the account
@@ -1017,6 +1112,12 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
             tail = [line for line in (result.stderr or result.stdout or "").splitlines() if line.strip()]
             if tail:
                 parts.append(self.store.redact(tail[-1].strip())[:160])
+        quiet = failed_quietly(result)
+        if quiet:
+            # Beside the exit code rather than instead of it, and the step keeps its
+            # tick: 0 is what the server said. What the operator must not have to do is
+            # read the transcript afterwards to find out that the step said this too.
+            parts.append(f"stderr: {self.store.redact(quiet)[:160]}")
         return " - ".join(parts)
 
     def _format_result(self, index: int, result, target: Target, step: Step | None = None) -> str:
@@ -1039,6 +1140,11 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
             # Straight after the exit code, because it is the exit code that needs
             # explaining and the output below it is fine.
             parts.append(PIPE_CLOSED_NOTE)
+        quiet = failed_quietly(result)
+        if quiet:
+            # Also straight after the exit code, and for the same reason: the 0 above is
+            # what the model will otherwise read the whole step by.
+            parts.append(QUIET_FAILURE_NOTE.format(line=repr(self.store.redact(quiet)[:200])))
         if result.timed_out:
             parts.append(f"the command was killed after {self.limits.command_timeout:.0f}s")
         if result.output_truncated:
@@ -1218,6 +1324,23 @@ to stop and ask about. You have at most {self.limits.max_steps} steps."""
                     said.append(unexplained_check_note(command))
                 broken.append("\n".join(said))
         return broken
+
+    @staticmethod
+    def _gave_up_at(index: int, error: str) -> str:
+        """Why a run stopped when the gateway was the one that stopped it.
+
+        Where it happened, because that is the difference between a key that never
+        worked and a run that was 40 steps into a database and worth resuming.
+        """
+        where = "asking for the first step" if index == 1 else f"asking for step {index}"
+        return f"the gateway failed while {where}: {error}"
+
+    @staticmethod
+    def _unusable_at(index: int) -> str:
+        """The same for a model that would not answer in the format it was given."""
+        if index == 1:
+            return "the model never produced a usable step"
+        return f"the model produced nothing usable for step {index}"
 
     def _finish(self, status: str, summary: str, steps: int, executed: int) -> Outcome:
         self.record.status = status

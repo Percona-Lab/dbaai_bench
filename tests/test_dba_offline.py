@@ -23,6 +23,7 @@ from do_dba.agent import (
     FILTER_EMPTY_NOTE,
     PIPE_CLOSED_NOTE,
     PIPE_CLOSED_VERIFY,
+    QUIET_FAILURE_NOTE,
     RESULT_HINTS,
     SIGPIPE_EXIT,
     STUB_CHARS,
@@ -152,6 +153,44 @@ class FilteringDroplet(FakeDroplet):
         result = super().run(command, timeout=timeout)
         if "| grep -v Warning" in command:
             return replace(result, exit_code=1, stdout="", stderr="")
+        return result
+
+
+class QuietFailureDroplet(FakeDroplet):
+    """A server whose step fails in the middle and still exits 0.
+
+    Two shapes, both verbatim from recorded runs. `dnf` skips a repo file it cannot
+    parse with a warning and carries on, so `dnf -y install percona-server-server`
+    comes back 0 having installed nothing - eight steps of two runs, six of them in one
+    run that read every 0 as the repository being configured. And an unterminated
+    heredoc is only a warning to bash, which ends the body at EOF: `cat > gr.cnf
+    <<'EOF'` wrote a zero-length file and came back 0, five steps across two runs.
+
+    The noise branch is the other half of the case: the lines a fresh image prints on
+    stderr on almost every install look exactly as alarming and mean nothing at all.
+    """
+
+    REPO_WARNING = "Warning: failed loading '/etc/yum.repos.d/percona.repo', skipping.\n"
+    HEREDOC_WARNING = (
+        "bash: line 1: warning: here-document at line 1 delimited by end-of-file "
+        "(wanted `EOF')\n"
+    )
+    NOISE = (
+        "debconf: unable to initialize frontend: Dialog\n"
+        "perl: warning: Setting locale failed.\n"
+        "mysql: [Warning] Using a password on the command line interface can be insecure.\n"
+        "Running kernel seems to be up-to-date.\n"
+    )
+
+    def run(self, command: str, timeout: float = 300.0) -> CommandResult:
+        result = super().run(command, timeout=timeout)
+        if "dnf" in command:
+            return replace(result, exit_code=0, stderr=self.REPO_WARNING,
+                           stdout="Nothing to do.\nComplete!\n")
+        if "<<'EOF'" in command:
+            return replace(result, exit_code=0, stderr=self.HEREDOC_WARNING, stdout="")
+        if "apt-get update" in command:
+            return replace(result, stderr=self.NOISE)
         return result
 
 
@@ -662,6 +701,80 @@ def main() -> int:
     check(failures, "Do not end a step" in filter_agent.messages[0]["content"]
           and "|| true" in filter_agent.messages[0]["content"],
           "the rules do not warn against ending a step with a filter")
+
+    # --------------------------------- a failure on stderr under an exit 0
+    # The third pipefail edge, and the one that reads as good news. 25 of the 1,293
+    # executed steps in the recorded runs came back 0 with a line on stderr saying
+    # something had failed, across nine runs; the worst spent six steps installing from
+    # a repository dnf was skipping, believing each 0. So the note goes on the step, the
+    # operator's line carries the line itself, and neither turns the step into a failure
+    # - it exited 0 and the harness has nothing better to go on than that.
+    quiet_agent, quiet_record, _, quiet_events = build(
+        QuietFailureDroplet(), SecretStore(),
+        ["ACTION: run\nCOMMAND: dnf -y install percona-server-server",
+         "ACTION: run\nCOMMAND: apt-get update",
+         "ACTION: done\nVERIFY: systemctl is-active ssh\nSUMMARY: the server is installed"],
+        directory=RUNS / "quiet-failure",
+    )
+    quiet = quiet_agent.run()
+    quiet_report = quiet_record.write_report().read_text(encoding="utf-8")
+    check(failures, quiet.status == "done", f"the quiet-failure run ended {quiet.status}")
+    skipped, noisy = quiet_record.steps[0], quiet_record.steps[1]
+    check(failures, skipped.exit_code == 0 and "failure on stderr" in (skipped.note or ""),
+          f"the record does not say the 0 was not the whole story: note {skipped.note!r}")
+    check(failures, "failure on stderr" in quiet_report,
+          "the report does not carry the note either")
+    told = [m["content"] for m in quiet_agent.messages
+            if QUIET_FAILURE_NOTE[:40] in m["content"]]
+    check(failures, len(told) == 1,
+          f"the model was told about the quiet failure {len(told)} times, want 1")
+    check(failures, told and "failed loading" in told[0],
+          f"the note does not quote the line it is about:\n{told[0] if told else '(none)'}")
+    # The step exited 0, so it keeps its tick - but not silently, or the only place that
+    # line exists is a transcript nobody reads until the run has already gone wrong.
+    check(failures, all(kind != "fail" for kind, _ in quiet_events),
+          f"a step that exited 0 was shown to the operator as a failure: {quiet_events}")
+    check(failures, any(kind == "ok" and "failed loading" in message
+                        for kind, message in quiet_events),
+          f"the operator saw a bare exit 0: {quiet_events}")
+    # And the lines every noninteractive install prints get nothing: debconf's frontend,
+    # perl's locale, the client's password warning. They are failure-shaped and mean
+    # nothing, and a note that arrives on ordinary apt output is worth nothing by the
+    # third step.
+    check(failures, not noisy.note,
+          f"ordinary install noise was called a failure: {noisy.note!r}")
+    check(failures, len(told) == 1,
+          "the note also arrived on the step whose stderr was only image noise")
+
+    # A run of them does not stop the run: the exit codes are zeros, and the harness
+    # cannot tell a step that failed quietly from one that worked.
+    thrash_quiet, _, _, _ = build(
+        QuietFailureDroplet(), SecretStore(),
+        ["ACTION: run\nCOMMAND: dnf -y install percona-server-server"] * allowed
+        + ["ACTION: done\nVERIFY: systemctl is-active ssh\nSUMMARY: nothing to report"],
+        directory=RUNS / "quiet-failure-thrash",
+    )
+    check(failures, thrash_quiet.run().status == "done",
+          f"{allowed} steps that exited 0 were counted as failures")
+
+    # A step that reports its own failure is left alone: there the exit code is the
+    # diagnosis, and the note would be telling the model what it can already see.
+    loud = quiet_agent._format_result(1, CommandResult(
+        command="dnf -y install percona-server-server", exit_code=1, stdout="",
+        stderr=QuietFailureDroplet.REPO_WARNING, duration=0.1), quiet_agent.fleet.only)
+    check(failures, QUIET_FAILURE_NOTE[:40] not in loud,
+          f"a step that failed outright was told its 0 meant nothing:\n{loud}")
+    # The heredoc bash only warned about, which is how a zero-length config file gets
+    # written and reported as a success.
+    empty_file = quiet_agent._format_result(2, CommandResult(
+        command="cat > /etc/mysql/conf.d/gr.cnf <<'EOF'", exit_code=0, stdout="",
+        stderr=QuietFailureDroplet.HEREDOC_WARNING, duration=0.1), quiet_agent.fleet.only)
+    check(failures, QUIET_FAILURE_NOTE[:40] in empty_file and "end-of-file" in empty_file,
+          f"an unterminated heredoc passed as a clean step:\n{empty_file}")
+
+    # And the rules say it before the first step, not only after one has gone wrong.
+    check(failures, "0 is the last command's verdict" in quiet_agent.messages[0]["content"],
+          "the rules do not warn that an exit 0 covers the last command only")
 
     # ------------------------------------------- a hint on stdout, not stderr
     # 57% of the executed steps in the recorded runs redirect stderr into stdout and only

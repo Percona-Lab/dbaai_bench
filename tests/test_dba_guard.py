@@ -109,6 +109,37 @@ COMMANDS: list[tuple[str, str]] = [
     ("mysqld --validate-config", guard.ALLOW),
     ("setpriv --reuid=mysql --clear-groups /usr/sbin/mysqld --initialize-insecure",
      guard.ALLOW),
+    # What `ldd` itself runs: the loader lists the libraries and exits before main. A
+    # step reaches for this to find out which library a tarball build is missing, and
+    # reading it as a server start refused the question.
+    ("LD_TRACE_LOADED_OBJECTS=1 /usr/local/mysql/bin/mysqld", guard.ALLOW),
+    ("LD_TRACE_LOADED_OBJECTS=1 /usr/local/mysql/bin/mysqld | grep 'not found'",
+     guard.ALLOW),
+    ("env LD_TRACE_LOADED_OBJECTS=1 /usr/sbin/mariadbd", guard.ALLOW),
+    ("LD_LIBRARY_PATH=/usr/local/mysql/lib LD_TRACE_LOADED_OBJECTS=1 bin/mysqld",
+     guard.ALLOW),
+    ("ldd /usr/local/mysql/bin/mysqld | grep -E 'not found'", guard.ALLOW),
+    # And the recorded shape of that question: the program being run is the first word
+    # inside the substitution, not the path handed to it. Read the other way round this
+    # came back as a mysqld start, twice in one run, and the model's next step hid the
+    # binary behind a glob so that no command line would name it.
+    ("missing=$(ldd \"$PSM/bin/mysqld\" 2>/dev/null | awk '/not found/{print $1}' | sort -u || true)",
+     guard.ALLOW),
+    ("libs=$(sudo -u mysql ldd /usr/sbin/mysqld)", guard.ALLOW),
+    ("ver=$(mysqld --version | head -1)", guard.ALLOW),
+    ("rows=$(mysql -N -e 'SELECT 1' | wc -l)", guard.ALLOW),
+    ("width=$((80 - 4))", guard.ALLOW),  # arithmetic, not a command substitution
+    # Printing what the config files set, and stopping there. Three recorded steps asked
+    # mysqld this and were refused; two older ones asked mariadbd and were allowed only
+    # because the rule did not exist yet.
+    ("mysqld --print-defaults", guard.ALLOW),
+    ("mariadbd --print-defaults 2>/dev/null | head -n 80", guard.ALLOW),
+    ("mysqld --print-defaults 2>&1 | tr ' ' '\\n' | grep -E 'server-id|bind' || true", guard.ALLOW),
+    # A client asked for help prints its options and exits, exactly as the server does.
+    ("mysql --help | grep -A1 'Default options' | tail -2", guard.ALLOW),
+    ("mysql --print-defaults", guard.ALLOW),
+    ("psql --help | head -n 5", guard.ALLOW),
+    ("mongosh --help", guard.ALLOW),
     ("mysql -e 'SELECT 1' && psql -c 'SELECT 1'", guard.ALLOW),
     ("mysql -uroot -e \"DELETE FROM app.sessions WHERE id = 3\"", guard.ALLOW),
     ("useradd -m -s /bin/bash app_user", guard.ALLOW),
@@ -137,6 +168,21 @@ COMMANDS: list[tuple[str, str]] = [
     ("mysqld", guard.BLOCK),
     ("mysqld --user=mysql", guard.BLOCK),
     ("mysqld --defaults-file=/etc/mysql/my.cnf --datadir=/var/lib/mysql", guard.BLOCK),
+    # `&&` is a conditional, not the background operator: what follows the server start
+    # never runs, because the start never returns.
+    ("mysqld --user=mysql && systemctl status mysql", guard.BLOCK),
+    # The loader needs a value in that variable to trace, and an assignment anywhere but
+    # in front of the program is not in the environment at all: neither of these lists
+    # anything, both start the server.
+    ("LD_TRACE_LOADED_OBJECTS= /usr/sbin/mysqld", guard.BLOCK),
+    ("LD_LIBRARY_PATH=/usr/local/mysql/lib /usr/local/mysql/bin/mysqld", guard.BLOCK),
+    # Resolving the substitution to its own program cuts both ways: a server started
+    # inside one holds the step just as long, and a client opened inside one still waits
+    # for input. Neither was judged at all while the next token was taken for the program.
+    ("out=$(mysqld)", guard.BLOCK),
+    ("rows=$(mysql | wc -l)", guard.BLOCK),
+    # `-h` is the host flag here, not help, so it says nothing about a session ending.
+    ("mysql -h 127.0.0.1 -uroot", guard.BLOCK),
     # Dropping to the database account does not change what is being run. While these
     # two were unknown prefixes the program behind them was never classified at all.
     ("runuser -u postgres -- psql", guard.BLOCK),
@@ -224,6 +270,17 @@ COMMANDS: list[tuple[str, str]] = [
     ("kill -9 $(pgrep mysqld)", guard.CONFIRM),
     ("setenforce 0", guard.CONFIRM),
     ("journalctl --vacuum-time=1s", guard.CONFIRM),
+    # Backgrounded, so the step returns and the reason for blocking a foreground start is
+    # gone; what is left is a server outside systemd, which is worth asking about and not
+    # worth refusing. All three shapes are recorded, and two are the documented way out of
+    # a lost root password. The `&` survives quoting, a redirection that only looks like it
+    # (`2>&1`), and a wrapper whose payload is judged one level down.
+    ("mysqld --skip-grant-tables --skip-networking --user=mysql &", guard.CONFIRM),
+    ("sudo -u mongodb mongod --config /etc/mongod.conf > /tmp/mongod.log 2>&1 &", guard.CONFIRM),
+    ("/usr/sbin/mysqld --skip-grant-tables --socket=/var/lib/mysql/mysql.sock & sleep 5",
+     guard.CONFIRM),
+    ("bash -c 'mysqld --skip-grant-tables' &", guard.CONFIRM),
+    ("nohup mysqld --skip-grant-tables &", guard.CONFIRM),
 
     # ---- MariaDB ----------------------------------------------------------
     # Grouped by engine rather than by verdict from here on: what matters for a
@@ -293,6 +350,21 @@ COMMANDS: list[tuple[str, str]] = [
     ("mongod --version", guard.ALLOW),
     ("mongod --fork --config /etc/mongod.conf --logpath /var/log/mongodb/mongod.log",
      guard.ALLOW),
+    # A listing asked for by a value rather than by a flag: mongod prints the parameters it
+    # accepts and stops, and a build that does not read `help` as a listing rejects it as a
+    # parameter name and stops too. Both recorded blocks piped it into grep, looking for the
+    # knob behind a server that would not start.
+    ("mongod --setParameter help 2>&1 | grep -iE 'kernel' | head -n 20 || true", guard.ALLOW),
+    ("/usr/bin/mongod --setParameter help 2>&1 | grep -iE 'tcmalloc|rseq|per.?cpu' "
+     "|| echo '(none)'", guard.ALLOW),
+    ("mongod --setParameter=help", guard.ALLOW),
+    # The resolved config, printed and not run.
+    ("mongod --outputConfig -f /etc/mongod.conf", guard.ALLOW),
+    # A direct run that returns on its own, which is what the block below tells a step to do
+    # when it needs the startup error and systemctl has already failed. Pinned here because
+    # counting `timeout` as a wrapper would resolve the program to mongod and take it away.
+    ("timeout 20 /usr/bin/mongod --config /etc/mongod.conf 2>&1 | head -n 20 || true",
+     guard.ALLOW),
     ("mongodump --db app --out /var/backups/mongo", guard.ALLOW),
     ("mongosh", guard.BLOCK),
     ("mongo", guard.BLOCK),
@@ -300,6 +372,10 @@ COMMANDS: list[tuple[str, str]] = [
     ("mongod", guard.BLOCK),
     # --config is not --fork: this one holds the terminal too.
     ("mongod --config /etc/mongod.conf", guard.BLOCK),
+    # A parameter being set is a server being started, and a value that merely begins with
+    # `help` is a parameter name like any other.
+    ("mongod --setParameter tcmallocReleaseRate=5.0", guard.BLOCK),
+    ("mongod --setParameter helpText=on", guard.BLOCK),
     ("mongosh --eval 'db.dropDatabase()'", guard.CONFIRM),
     ("mongosh app --eval 'db.widgets.drop()'", guard.CONFIRM),
     ("mongosh admin --eval 'db.dropUser(\"app\")'", guard.CONFIRM),
@@ -384,6 +460,85 @@ SCRIPT_BODIES: list[tuple[str, str, str]] = [
     # programs - which is to say not judged at all
     ("/tmp/wipe.py", "import shutil\nshutil.rmtree('/var/lib/mysql')\n", guard.CONFIRM),
     ("/tmp/ok.py", "#!/usr/bin/env python3\nprint('hello')\n", guard.ALLOW),
+]
+
+# The script action, whose body runs as it stands - so the rules about what would hang
+# this step apply here, unlike a body that is only being written to a file.
+# (label, body, expected)
+SHELL_SCRIPTS: list[tuple[str, str, str]] = [
+    ("a survey that starts nothing",
+     "#!/bin/bash\nset -uo pipefail\nsystemctl status mysql --no-pager | head -n 5\n",
+     guard.ALLOW),
+    # A command split over physical lines is one command. Taken apart, the halves are two
+    # commands the script never runs: seven recorded blocks were exactly this, and every
+    # one of them was wrong.
+    ("a container started with its command on a continuation line",
+     "#!/bin/bash\ndocker run -d --name mongo \\\n  -p 27017:27017 \\\n"
+     "  -v /var/lib/mongodb:/data/db \\\n  mongo:8.0 \\\n"
+     "  mongod --config /etc/mongod.conf\nsleep 15\n",
+     guard.ALLOW),
+    ("a core dump read by gdb, which names the binary on a continuation line",
+     "set -uo pipefail\ngdb -batch \\\n  -ex 'set pagination off' \\\n"
+     "  -ex 'thread apply all bt' \\\n"
+     "  /usr/bin/mongod /var/crash/core.1234 2>&1 | head -n 40\n",
+     guard.ALLOW),
+    ("a statement on the line after the client that runs it",
+     "#!/bin/bash\nmysql --no-defaults --connect-expired-password -uroot -p\"$TMP\" \\\n"
+     "  -e \"ALTER USER 'root'@'localhost' IDENTIFIED BY '$ROOT_SQL';\"\n",
+     guard.ALLOW),
+    # Joining lines is not the same as excusing them: on its own line it is still a
+    # server held in the foreground until the command timeout.
+    ("a server started in the foreground",
+     "#!/bin/bash\nsystemctl stop mongod\nmongod --config /etc/mongod.conf\n", guard.BLOCK),
+    # An even run of backslashes is an escaped backslash, and ends the line.
+    ("a line ending in an escaped backslash, and a server start below it",
+     "#!/bin/bash\nprintf 'a\\\\'\nmongod --config /etc/mongod.conf\n", guard.BLOCK),
+    # Backgrounded on one line of a script reads the same as backgrounded on its own: the
+    # script keeps going, and one asked-about line is enough to hold the whole script.
+    ("a password reset, which needs a server systemd will not start",
+     "#!/bin/bash\nsystemctl stop mysql\nmysqld --skip-grant-tables --skip-networking "
+     "--user=mysql &\nsleep 8\nmysql -e \"FLUSH PRIVILEGES\"\n", guard.CONFIRM),
+    # A heredoc body that lands in a file is file content, not shell text. Both of these
+    # are recorded blocks: judged as commands, the wrapper script's `exec mongod` and the
+    # unit's ExecStart read as a server start, which is the one thing a unit is for. One
+    # model left a comment saying its wrapper existed "to bypass the safety guard's
+    # detection of mongod in ExecStart" - a rule that teaches models to hide from it is
+    # worse than no rule.
+    ("a wrapper script written by a heredoc",
+     "#!/bin/bash\ncat > /usr/local/bin/mongod-wrapper.sh <<'EOF'\n#!/bin/bash\n"
+     "export MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=0\n"
+     "exec /usr/bin/mongod -f /etc/mongod.conf\nEOF\n"
+     "chmod +x /usr/local/bin/mongod-wrapper.sh\nsystemctl restart mongod\n",
+     guard.ALLOW),
+    ("a systemd unit written by a heredoc",
+     "cat <<EOF > /etc/systemd/system/mongod.service\n[Service]\nUser=mongodb\n"
+     "Environment=\"GLIBC_TUNABLES=glibc.pthread.rseq=0\"\n"
+     "ExecStart=/usr/bin/env bash -c \"MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=0 "
+     "/usr/bin/mongod -f /etc/mongod.conf\"\nEOF\nsystemctl daemon-reload\n",
+     guard.ALLOW),
+    # What the file rules do see in a body: the settings that decide who can reach the
+    # database. This is the verdict that has to survive the change above.
+    ("a my.cnf written by a heredoc",
+     "cat > /etc/mysql/my.cnf <<'EOF'\n[mysqld]\nserver-id = 1\nbind-address = 0.0.0.0\nEOF\n",
+     guard.CONFIRM),
+    ("a mongod.conf written by a heredoc",
+     "cat > /etc/mongod.conf <<EOF\nnet:\n  port: 27017\n  bindIp: 0.0.0.0\nEOF\n",
+     guard.CONFIRM),
+    # A heredoc with no file behind it is text a program will run, so it stays a command.
+    ("SQL piped into the client by a heredoc",
+     "mysql -uroot <<'EOF'\nDROP DATABASE app;\nEOF\n", guard.CONFIRM),
+    ("a script piped into bash by a heredoc",
+     "bash <<'EOF'\nmongod --config /etc/mongod.conf\nEOF\n", guard.BLOCK),
+    # A herestring is one line. Read as a heredoc named `notes`, it would swallow the rest
+    # of the script as the body of a file and nothing below it would be judged at all.
+    ("a herestring, and a server start below it",
+     "grep -q mysqld <<<notes > /tmp/found.txt\nmongod --config /etc/mongod.conf\n",
+     guard.BLOCK),
+    # The other half of the trade: text in a text file is not commands, the same way a
+    # .sql handed to write_file is data. Recorded nowhere, kept here because it is the
+    # cost of reading a written body as a file rather than as shell.
+    ("commands written into a text file",
+     "cat > /tmp/notes.txt <<'EOF'\nrm -rf /var/lib/mysql\nEOF\n", guard.ALLOW),
 ]
 
 # A python script goes through the same rules the shell rules use, reached through
@@ -860,6 +1015,13 @@ def main() -> int:
                 f"classify_file_content(<{path}>) -> {verdict.level} ({verdict.reason}), want {expected}"
             )
 
+    for label, body, expected in SHELL_SCRIPTS:
+        verdict = guard.classify_script_body(body, "bash")
+        if verdict.level != expected:
+            failures.append(
+                f"classify_script_body({label}) -> {verdict.level} ({verdict.reason}), want {expected}"
+            )
+
     for label, body, expected in PYTHON_BODIES:
         verdict = guard.classify_script_body(body, "python3")
         if verdict.level != expected:
@@ -893,7 +1055,7 @@ def main() -> int:
         failures.append(f"parse({label}) should have failed, returned {step}")
 
     total = (len(COMMANDS) + len(FILE_WRITES) + len(FILE_BODIES) + len(SCRIPT_BODIES)
-             + len(PYTHON_BODIES) + len(REPLIES) + len(BAD_REPLIES))
+             + len(SHELL_SCRIPTS) + len(PYTHON_BODIES) + len(REPLIES) + len(BAD_REPLIES))
     print(f"{total - len(failures)}/{total} cases passed")
     for failure in failures:
         print(f"  FAIL {failure}")

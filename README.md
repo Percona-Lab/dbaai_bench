@@ -353,8 +353,9 @@ Every command, every script and every file write is classified before execution
   (`bind-address`, `listen_addresses`, `bind` in valkey.conf, `bindIp` in
   mongod.conf), turning authentication off (`skip-grant-tables`,
   `authorization: disabled`, `CONFIG SET requirepass ''`), empty or `'%'` grants,
-  touching `authorized_keys`/`sshd_config`/sudoers, `curl … | sh`, and anything
-  that sends data off the box.
+  a database server backgrounded with `&` instead of started through systemd (see
+  below), touching `authorized_keys`/`sshd_config`/sudoers, `curl … | sh`, and
+  anything that sends data off the box.
 - **BLOCK** — never runs, and the reason is fed back so the model picks another
   approach. Two kinds: things that destroy the machine (`mkfs`, `dd of=/dev/sda`,
   `rm -rf /`, stopping sshd) and things that would hang forever on a closed
@@ -366,17 +367,54 @@ Every command, every script and every file write is classified before execution
   database server started by hand instead of through systemd (`mysqld`,
   `mongod` without `--fork`, `valkey-server` without `--daemonize`), and cache
   commands that stream until interrupted (`MONITOR`, `SUBSCRIBE`, `--stat`). A
+  server sent to the background with a trailing `&` is a CONFIRM instead of a
+  BLOCK: the step returns, so the reason for refusing it is gone, and what is left
+  is a server running outside systemd, where `systemctl status` will disagree with
+  `ps` for the rest of the run. Three recorded blocks were that shape, two of them
+  `mysqld --skip-grant-tables --skip-networking &` — the documented way back into a
+  server whose root password is lost, and the one server systemd will not start for
+  you. Put to an operator rather than refused: an unattended run with `--yes`
+  proceeds, and the step is in the report either way. `&&` is a conditional and
+  backgrounds nothing, so `mysqld && systemctl status mysql` still blocks. A
   daemon handed one job it ends after is not a start and runs:
   `mysqld --initialize-insecure` (the way out of a data directory too old to
   upgrade — a recorded run met `Cannot upgrade from 80046 to 90702` and was
-  refused this step) and `mysqld|mariadbd --validate-config`, which is how a bad
-  setting gets found without restarting the service to discover it. What is final
+  refused this step), `mysqld|mariadbd --validate-config`, which is how a bad
+  setting gets found without restarting the service to discover it, and
+  `--print-defaults`, which prints what the config files actually set and stops
+  before the server starts — three recorded steps asked mysqld for it and were
+  refused, two older ones asked mariadbd and were allowed only because this rule
+  did not exist yet. A client asked for help is the same: `mysql --help` prints
+  its options and the config files it read, then exits. Nor is a flag the only way
+  one of them returns. A listing can be asked for by value —
+  `mongod --setParameter help` prints the parameters the build accepts and stops,
+  and a build that does not read `help` as a listing rejects it as a parameter name
+  and stops too, so neither opens a port; two recorded steps piped it into `grep`
+  looking for the knob behind a server that would not start, and both were refused
+  a listing on the grounds that it was a start. `--outputConfig` is the same kind of
+  question about the config rather than the parameters. What a set parameter is not
+  is a listing: `mongod --setParameter tcmallocReleaseRate=5.0` is a server being
+  started with a setting, and blocks. The program inside a command substitution is the one being
+  run, so `missing=$(ldd "$PSM/bin/mysqld" | awk '/not found/{print $1}')` is an
+  `ldd` and not a `mysqld` — read the other way round it was blocked twice in one
+  run, refusing the ordinary way to find out which library a tarball build is
+  missing, and the model's next step globbed the `bin` directory so that no command
+  line would name the server binary at all.
+  `LD_TRACE_LOADED_OBJECTS=1 /path/to/mysqld` is allowed for the same reason: it is
+  what `/usr/bin/ldd` itself runs, and the loader prints the libraries the binary
+  wants and exits before `main`, opening no port — while an empty value, or the
+  same text anywhere but in front of the program, still reads as a start. What is
+  final
   about a reinstall is the `rm`/`mv` of the data directory, which is classified on
   its own; `--initialize` refuses a directory that still has files in it. Also
   here: `su`/`runuser` with no command, which open an interactive shell as that
   user and sit there. The hang class matters more in practice: it is the
   difference between a model that gets a useful error and one that sits at a
-  prompt until the timeout.
+  prompt until the timeout. Which is also why the reason a blocked server start
+  gets back names two ways out, not one: the recorded steps that hit that rule were
+  not trying to run a service by hand, they were trying to see why it would not
+  start after systemctl had already failed, so the reason offers
+  `timeout 20 mongod …` — bounded, so it returns on its own, and allowed.
 
 Wrappers are stripped before classification and `bash -c` payloads are
 classified recursively, so `sudo env … bash -c 'rm -rf /'` is not a way around
@@ -433,7 +471,7 @@ one line of it. `INTERPRETER:` is `bash` or `python3`, however the model spells 
 and with neither it is bash. A third language is refused rather than guessed at,
 because the guard has rules for those two and nothing to say about perl.
 
-Four things follow from a script being one step rather than many:
+Five things follow from a script being one step rather than many:
 
 - **It is judged whole, before any of it is copied.** One blocked line stops the
   whole script and the model is told which line — `line 3 of the script, 'mysql':
@@ -441,7 +479,24 @@ Four things follow from a script being one step rather than many:
   point: an interpreter reads a file as it goes, so a script judged line by line as
   it ran would half-apply a step that was approved whole. This is the same reason
   every command gets a `bash -n` pass, and scripts get one too (`py_compile` for
-  python) before execution.
+  python) before execution. A line means a logical line: a command split across
+  physical lines with backslashes is joined back up first, because taken apart the
+  halves are two commands the script never runs — seven recorded blocks were exactly
+  that, `docker run -d \` … `mongod --config …` read as a bare mongod, and
+  `gdb -batch … \` … `/usr/bin/mongod core` read as a server start when the program
+  was gdb.
+- **A heredoc body that lands in a file is judged as a file, not as shell.** The
+  config rules read it — a `bind-address = 0.0.0.0` written by `cat > my.cnf <<EOF`
+  is the same CONFIRM as one written by `write_file` — while the rules about what
+  would hang this step step aside, because nothing here runs it, and because a
+  unit's `ExecStart` and a wrapper script's `exec mongod` are *meant* to hold the
+  foreground: that is how systemd supervises a service. Three recorded blocks were
+  that, and one model wrote its wrapper with the comment "bypass the safety guard's
+  detection of `mongod` in ExecStart" — a rule that teaches models to hide from it
+  is worse than no rule. A heredoc with no file behind it (`mysql <<EOF`,
+  `bash <<EOF`) is text a program will run, and stays a command. The cost of the
+  trade is that commands written into a plain text file are no longer read as
+  commands, which is already true of anything `write_file` puts there.
 - **What you approve is the body.** A CONFIRM shows the script itself, not a summary
   of it, and the transcript and report keep it in full. Approving a description of a
   script is not approving the script.
@@ -538,9 +593,29 @@ database services, listening sockets), and:
 Statuses: `done`, `unverified` (finished but the checks disagree), `aborted` (the
 model gave up and said why), `exhausted` (`--max-steps` or `--max-cost`),
 `failed` (ten steps in a row failed, SSH dropped, or no readable step),
-`cancelled` (you declined the plan or pressed Ctrl+C), `stuck` (three blocked
-steps in a row). `done` exits 0; every other status exits non-zero, so a run is
-scriptable without reading the report.
+`api-error` (the gateway stopped serving the run — see below), `cancelled` (you
+declined the plan or pressed Ctrl+C), `stuck` (three blocked steps in a row).
+`done` exits 0; every other status exits non-zero, so a run is scriptable
+without reading the report.
+
+`api-error` is separate from `failed` because it is not the model's doing and not
+a result to keep: a rate limit ended one benchmark run at step 2 of 120. A 429 is
+waited out first — the gateway's `Retry-After` where it sends one, otherwise 5s,
+15s, 30s, 60s — for up to two minutes per request in total, which
+`--rate-limit-wait` sets, or `$DO_INFERENCE_RATE_LIMIT_WAIT` (`0` fails on the
+first 429 instead). That budget is the *only* bound on the waiting: there is no
+separate limit on the number of waits, so raising it always buys more patience —
+`--rate-limit-wait 600` on a free tier that answers every other minute is a run
+that finishes rather than one that ends at step 35. Only when the budget runs out
+does the run end, and then it says what it waited and what the next wait would
+have been.
+
+A reply that is not a reply ends the same way. A gateway can answer 200 with a
+body that is not JSON — OpenRouter pads a queued request with newlines, and one
+run got 3.4 kB of padding with nothing after it — which is a `JSONDecodeError`
+from inside the SDK rather than an API error, and used to end the run in a
+traceback at step 3 of 100. It is asked again twice, 2s and 5s apart, and only
+then reported, with what the gateway actually sent.
 
 ## What a run leaves behind
 
@@ -568,7 +643,7 @@ line from it and the next run generates a new value for that name;
 | --- | --- |
 | servers | `--host [NAME=][USER@]HOST[:PORT]` (required except with `--list-models`, repeatable; unnamed servers are labelled `node1`, `node2`, … and the model assigns the roles — see [More than one server](#more-than-one-server)), `-u/--user` (root), `-p/--port` (22), `-i/--key`, `--ask-key-passphrase`, `--ask-password`, `--no-server-secrets`, `--accept-host-key` |
 | task | `--task ...`, `--task-file PATH`, `-m/--model`, `--provider {openrouter,digitalocean,selfhosted}` (openrouter), `--mode {plan,step,auto,unattended}`, `--dry-run`, `--yes`, `--probe` |
-| limits | `--max-steps` (40), `--timeout` (300s per command), `--max-cost USD`, `--temperature` (0.2), `--effort {low,medium,high}` (off) |
+| limits | `--max-steps` (40), `--timeout` (300s per command), `--max-cost USD`, `--temperature` (0.2), `--effort {low,medium,high}` (off), `--rate-limit-wait SECONDS` (120, or `$DO_INFERENCE_RATE_LIMIT_WAIT`) |
 | output | `--runs-dir` (`output/` in this project, or `$DBA_RUNS_DIR`), `--list-models`, `--no-color`, `--version` |
 
 Cost is what the gateway says it charged, wherever it will say. Every OpenRouter
@@ -762,6 +837,40 @@ phase is also one silent request: the reply is not streamed, so raise
   there exit 1 is the answer to the question the model asked. Rule 6 now also
   tells the model not to write steps that end in a filter, and not to throw
   stderr away on a step it may have to debug.
+- **An exit 0 is the last command's verdict, not the step's.** The third pipefail
+  edge, and the only one that reads as good news: the step comes back 0 with a
+  failure already behind it, the diagnosis on stderr and nothing else to say so.
+  25 of the 1,293 executed steps now in the corpus — it has grown since the
+  935-step figures above — came back that way, across nine runs. The worst is a
+  repo file `dnf` would not parse: `Warning: failed loading
+  '/etc/yum.repos.d/percona.repo', skipping.` on eight steps of two runs, six of
+  them in one run that read every exit 0 and every `Nothing to do` as the
+  repository being configured — it reinstalled `percona-release` twice, tried four
+  package names, and ran out of steps having installed nothing. The next is an
+  unterminated heredoc, which bash only *warns* about before ending the body at
+  EOF: `cat > gr.cnf <<'EOF'` wrote a zero-length file, came back 0, and one run
+  went on to configure a three-node cluster from empty config files — five steps
+  across two runs, all of them now caught by the parser, which keeps the lines
+  below a single-line `COMMAND:`, though a `COMMAND_BEGIN` block or a script can
+  still do it. The singletons are the same shape: `awk: fatal: cannot open file
+  /etc/mysql/debian.cnf`, `chown: … Operation not permitted` on a key file,
+  `wget: invalid option -- 's'`, `Job for mysql.service failed`. So the harness
+  says so: the observation quotes the line and says what the 0 does and does not
+  cover, the operator's line carries it beside the exit code instead of a bare
+  tick, and the step is recorded as `exited 0 with a failure on stderr`. An
+  explanation, not a verdict — the step keeps the success it reported, because 0 is
+  all the harness has to go on, so a run of them cannot end a run as `failed`
+  either; and a step that failed outright gets nothing added, its exit code being
+  the diagnosis already. The line has to be worth saying: 46 of the 71
+  exit-0-with-stderr steps in the corpus say nothing of the sort — needrestart's
+  `Running kernel seems to be up-to-date`, the client's password warning, `gpg`
+  creating its keyring, `wget`'s progress line — and the failure-shaped lines that
+  mean nothing are named as such, because `debconf: unable to initialize frontend`,
+  `perl: warning: Setting locale failed` and curl's write error behind a `| head`
+  sit on more steps than the real ones. Checks are left alone: none of the 324
+  passing `VERIFY` checks in the corpus printed anything of the kind, so a check
+  that passes is still a check that passes. Rule 7 now says it before the first
+  step as well as after one has gone wrong.
 - **A check that fails without saying why is told so.** Five of the seven failed
   `VERIFY` checks across the recorded runs printed nothing that could explain
   them, in three separate runs, and four discarded the answer themselves —
@@ -846,7 +955,7 @@ stops it afterwards. Everything it runs is offline: no key, no network, no serve
 | Suite | What it covers |
 | --- | --- |
 | `guard` | Every guard verdict — commands, file bodies, shell scripts, python scripts — and every reply the parser has to survive, as a table of cases |
-| `offline` | The whole loop against `fake_droplet.py` with a scripted model — statuses, verification, unreadable checks, secrets, protocol recovery, script steps, and the context budget: what each window size derives, what is trimmed and what is not, and the reply cap reaching the request |
+| `offline` | The whole loop against `fake_droplet.py` with a scripted model — statuses, verification, unreadable checks, a step that exits 0 with a failure on its stderr, secrets, protocol recovery, script steps, and the context budget: what each window size derives, what is trimmed and what is not, and the reply cap reaching the request |
 | `prompts` | Who answers each y/n question — the operator, `--yes` or `--mode unattended` — and that answering them all still leaves the guard's blocks in force |
 | `engines` | MariaDB, Valkey and MongoDB end to end — compatibility names, a runtime password that has to be rewritten to survive a restart, a vendor repository, authorization turned on after the fact |
 | `fleet` | Several servers — `--host` forms, labelling the ones left unnamed, which server a `HOST:` line means, refusing a step that does not say, scoped checks, peer reachability, and two two-droplet MySQL replication runs judged from both ends |

@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import secrets
 import shlex
 import socket
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -346,6 +348,28 @@ class SSHRunner:
                 sftp.mkdir(SCRIPT_DIR, 0o700)
             except OSError:
                 pass  # already there, which is the usual case after the first script
+            # The mode is verified rather than trusted, whatever the mkdir did.
+            # On a shared box a local user can create /tmp/dba-harness first, and
+            # sticky-bit /tmp then lets them swap a script between the parse pass
+            # below and the run that follows it - a script which may carry a
+            # generated credential besides. A directory that is not owner-only is
+            # refused rather than written into; the one residual case is a 0700
+            # directory owned by someone else, which only root can write through
+            # and which SFTP st_uid is too unreliable to check for.
+            mode = stat.S_IMODE(sftp.stat(SCRIPT_DIR).st_mode)
+            if mode != 0o700:
+                return CommandResult(
+                    command=f"{interpreter} {path}",
+                    exit_code=1,
+                    stdout="",
+                    stderr=(
+                        f"harness: {SCRIPT_DIR} on the server exists with mode {mode:04o}, not 0700, "
+                        "so the scripts written there would not be private to the account this "
+                        f"harness connects as. Remove or rename {SCRIPT_DIR} on the server and send "
+                        "the step again."
+                    ),
+                    duration=time.monotonic() - started,
+                )
             with sftp.open(path, "wb") as handle:
                 handle.write(payload)
             sftp.chmod(path, 0o700)
@@ -393,7 +417,10 @@ class SSHRunner:
         except (paramiko.SSHException, OSError) as exc:
             raise SSHError(f"could not open SFTP on {self.host}: {exc}") from exc
 
-        staging = f"/tmp/.dba-harness-{abs(hash(path)) % 10**8}"
+        # A random name, not one derived from the target path: two runs working the
+        # same server at once must not stage onto each other's file, and a name a
+        # local user can predict in advance is one they can create first.
+        staging = f"/tmp/.dba-harness-{secrets.token_hex(8)}"
         try:
             with sftp.open(staging, "wb") as handle:
                 handle.write(payload)

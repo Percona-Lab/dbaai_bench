@@ -106,11 +106,26 @@ class RunRecord:
         )
 
     def event(self, kind: str, **payload) -> None:
-        record = {"kind": kind, **payload}
+        def scrub(value):
+            if isinstance(value, str):
+                return self.redact(value)
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            if isinstance(value, dict):
+                return {key: scrub(item) for key, item in value.items()}
+            return value
+
+        # Redacted before serializing, not the serialized line afterwards: a value
+        # holding a quote, a backslash or a newline comes out of json.dumps escaped,
+        # and a string replace would no longer recognise it there. An adopted
+        # credential, read off a keeper file an operator may have edited, is exactly
+        # the kind of value that can hold one - and a transcript that silently keeps
+        # it in the clear is the one thing this log must not do.
+        record = {"kind": kind, **{key: scrub(value) for key, value in payload.items()}}
         cleaned = json.dumps(record, ensure_ascii=False, default=str)
         try:
             with self.log_path.open("a", encoding="utf-8") as handle:
-                handle.write(self.redact(cleaned) + "\n")
+                handle.write(cleaned + "\n")
         except OSError:
             pass  # losing the log must not stop the work
 

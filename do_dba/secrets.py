@@ -30,6 +30,7 @@ reasonable one, and --no-server-secrets keeps them in the run directory only.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shlex
@@ -159,13 +160,14 @@ class SecretStore:
         if not self._values:
             return None
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Create with 0600 from the start rather than widening then narrowing.
-        handle = path.open("w", encoding="utf-8")
-        try:
-            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        except OSError:
-            pass  # best effort; Windows ACLs do not map onto POSIX modes
-        with handle:
+        # Created at 0600 by os.open, not opened under the umask's permissions and
+        # narrowed afterwards: between those two moments the file holds every
+        # credential in the clear at whatever the umask allowed. (Windows ACLs do
+        # not map onto POSIX modes; the CRT applies what it can of the mode, and a
+        # missing mapping is the same best effort the chmod here used to be.)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                             stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(self._values, handle, indent=2, sort_keys=True)
         return path
 

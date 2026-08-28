@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -46,6 +48,7 @@ from do_dba.secrets import (
     read_keeper,
     write_keeper,
 )
+from do_dba.report import HostInfo, RunRecord
 from do_dba.ssh import wrap_command
 from do_dba.term import Glyphs
 from fake_droplet import FakeDroplet
@@ -342,6 +345,61 @@ def check_across_runs(failures: list[str]) -> None:
           f"credentials on the server: {sorted(read_keeper(runner))}")
 
 
+def check_save_permissions(failures: list[str]) -> None:
+    """secrets.json is 0600 from the moment it exists.
+
+    The file holds every credential in the clear, so there must be no moment when
+    it exists at the umask's permissions waiting to be narrowed afterwards: the
+    mode is the one os.open creates the file with. (On Windows the POSIX mode maps
+    only onto the read-only bit, so the shape of the file is all that is checked.)
+    """
+    store = SecretStore()
+    store.resolve("{{DBA_SECRET:save_permissions}}")
+    path = RUNS / "permissions" / "secrets.json"
+    written = store.save(path)
+    check(failures, written == path, "save() did not return the path it wrote")
+    if os.name == "posix":
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        check(failures, mode == 0o600, f"secrets.json was created with mode {mode:04o}, not 0600")
+    else:
+        check(failures, path.is_file(), "secrets.json was not written")
+    body = json.loads(path.read_text(encoding="utf-8"))
+    check(failures, body == {"save_permissions": store.resolve("{{DBA_SECRET:save_permissions}}")},
+          "secrets.json does not hold exactly the store's values")
+
+
+def check_awkward_value_redaction(failures: list[str]) -> None:
+    """A credential holding JSON-escapable characters still leaves the transcript.
+
+    Redacting the serialized line cannot work for such a value: json.dumps escapes
+    the quote, the backslash and the newline, and the escaped form is not the string
+    the redactor is looking for. The values are scrubbed before serialization, which
+    is what an adopted credential - read off a keeper file an operator may have
+    edited by hand - needs, and what a generated one never happens to exercise.
+    """
+    value = 'p@ss"word\\with$new\nline'
+    store = SecretStore()
+    store.adopt({"awkward": value})
+    record = RunRecord(
+        directory=RUNS / "redaction",
+        task="redact an awkward value",
+        hosts=[HostInfo(name="one", label="root@host")],
+        model="test-model",
+        mode="auto",
+        dry_run=True,
+        redact=store.redact,
+    )
+    record.event("step", stdout=f"the password is {value}, end")
+    line = (record.directory / "transcript.jsonl").read_text(encoding="utf-8")
+    check(failures, value not in line,
+          "a value holding JSON-escapable characters leaked into the transcript in the clear")
+    check(failures, "{{DBA_SECRET:awkward}}" in line,
+          "the awkward value was not replaced with its placeholder in the transcript")
+    parsed = json.loads(line.splitlines()[-1])
+    check(failures, parsed["stdout"] == "the password is {{DBA_SECRET:awkward}}, end",
+          f"the redacted transcript line does not parse back to the placeholder: {parsed['stdout']!r}")
+
+
 def main() -> int:
     shutil.rmtree(RUNS, ignore_errors=True)
     failures: list[str] = []
@@ -350,6 +408,8 @@ def main() -> int:
     check_keeper_on_server(failures)
     check_fleet_adoption(failures)
     check_across_runs(failures)
+    check_save_permissions(failures)
+    check_awkward_value_redaction(failures)
 
     print()
     if failures:

@@ -13,6 +13,14 @@ DEFAULT_MODEL = "anthropic-claude-opus-5"
 # enough that a model which never responds does not hang the run.
 DEFAULT_STALL_TIMEOUT = 180.0
 
+# How long a request may spend waiting out 429s before the run gives up on it.
+# Two minutes because the limits that end runs are per-minute ones: a provider
+# behind a gateway says "retry in 30s" and means it, and a benchmark cell that
+# has already paid for its servers can afford to wait twice that rather than
+# throw away the other 119 steps it was going to take. Not so long that a key
+# with nothing left on it takes an hour to say so.
+DEFAULT_RATE_LIMIT_WAIT = 120.0
+
 # A model access key is the recommended credential; a DigitalOcean personal
 # access token also works. We accept whichever name the user happened to use.
 KEY_ENV_VARS = (
@@ -75,6 +83,21 @@ def find_api_key() -> str:
 
 def base_url() -> str:
     return os.environ.get("DO_INFERENCE_BASE_URL", "").strip() or DEFAULT_BASE_URL
+
+
+def rate_limit_wait(default: float = DEFAULT_RATE_LIMIT_WAIT) -> float:
+    """Seconds a single request may spend waiting out rate limits.
+
+    DO_INFERENCE_RATE_LIMIT_WAIT wins wherever it is set, and zero is a valid
+    answer: it restores the old behaviour of failing on the first 429, which is
+    what a test wants and what somebody watching a screen may want too.
+    """
+    raw = os.environ.get("DO_INFERENCE_RATE_LIMIT_WAIT", "").strip()
+    try:
+        value = float(raw)
+        return value if value >= 0 else default
+    except ValueError:
+        return default
 
 
 def stall_timeout(default: float = DEFAULT_STALL_TIMEOUT) -> float:
